@@ -295,13 +295,17 @@
         // clamped so the run itself always fits the canvas. A run that
         // cannot fit at all is the failure this fixture is looking for, and
         // it is reported as one rather than smuggled in as a bounds miss.
-        var width = ctx.measureText(text).width;
+        // (`textWidth`, not `width`: a `var width` here would reassign the
+        // parameter and make every message above report the wrong number.)
+        var textWidth = ctx.measureText(text).width;
         var lineHeight = parseFloat(style.fontSize) || 12;
-        if (width > scratch.width - 4) {
-          clipped.push(selector + " @" + width.toFixed(0) + "px wide");
+        if (textWidth > scratch.width - 4) {
+          clipped.push(selector + " @" + width + "px is " +
+            textWidth.toFixed(0) + "px wide");
           continue;
         }
-        var x = Math.max(2, Math.min(box.left, scratch.width - width - 2));
+        var x = Math.max(2,
+          Math.min(box.left, scratch.width - textWidth - 2));
         var y = Math.max(2,
           Math.min(box.top, scratch.height - lineHeight - 2));
         ctx.fillText(text, x, y);

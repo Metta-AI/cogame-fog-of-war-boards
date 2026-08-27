@@ -85,12 +85,20 @@
   // ---- the worst case ------------------------------------------------------
   // 80 runes exactly, which is what the server caps `say` at, in a mix of
   // wide and narrow glyphs.
+  //
+  // The padding rune is a MIDDLE DOT, never U+2026: viewer_smoke.mjs
+  // classifies any canvas draw matching /\u2026\s*$/ as `ellipsized`, and
+  // an ellipsized REMARK (as opposed to a nameplate) is precisely the
+  // signal that the say band is too small. Padding with the ellipsis
+  // itself burned that signal -- it made `ellipsized` permanently non-zero
+  // on remarks, so a real renderer ellipsis on a `say` could never again
+  // be told apart from this fixture's own filler.
   function fullSay(seat) {
     var base = seat === 0 ?
       "his chain has to cross d3 and i will sit on it until he pays for it \u2014 " :
       "they are bridging low so i take c2 now and let them waste a ply on b4 \u2014 ";
     var runes = Array.from(base);
-    while (runes.length < SAY_RUNES) runes.push("\u2026");
+    while (runes.length < SAY_RUNES) runes.push("\u00b7");
     return runes.slice(0, SAY_RUNES).join("");
   }
 
@@ -335,6 +343,14 @@
         if (runes !== SAY_RUNES) {
           problems.push("the say band at " + width + "px carried " + runes +
             " runes, not the full " + SAY_RUNES);
+        }
+        // A remark that ends in an ellipsis is a band that is too small
+        // (checklist 15: ellipsis is a design choice for labels and a
+        // defect for sentences). The fixture's own filler must never be
+        // the reason `ellipsized` counts a remark.
+        if (/\u2026\s*$/.test(node.textContent || "")) {
+          problems.push("the say band at " + width + "px ellipsized a " +
+            "remark; widen the band rather than shortening the text");
         }
       });
       var quoted = 0;

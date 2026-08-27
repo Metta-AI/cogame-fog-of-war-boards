@@ -53,6 +53,7 @@ type
     say*: string        ## spectator-facing, one line
     notes*: string      ## private, fed back to its author only
     guess*: seq[int]    ## cells this seat believes are the opponent's
+    scripted*: bool     ## a scripted baseline decided this ply
     fellBack*: bool     ## an LLM seat whose reply could not be used
 
   Baseline* = enum
@@ -316,6 +317,7 @@ proc scriptedDecision*(sim: Sim, seat: int, baseline: Baseline): Decision =
   result.cell =
     if baseline == blProbe: after.probeCell(seat)
     else: after.sweepCell(seat)
+  result.scripted = true
 
 # ---- Prompt building --------------------------------------------------------
 

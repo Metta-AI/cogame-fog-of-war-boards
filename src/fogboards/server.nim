@@ -317,8 +317,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if config.sense > 0 and decision.anchor >= 0:
             state.sim.applySense(mover, decision.anchor)
             sensed = true
+          ## `decision.scripted`, not the seat's declared flag: with no
+          ## credentials the client disables itself and a prompt seat is
+          ## decided by the baseline too, and the event field means
+          ## "decided by a scripted baseline" (types.nim).
           state.sim.applyAttempt(mover, decision.cell, decision.say,
-            decision.notes, decision.guess, seatScripted, decision.fellBack)
+            decision.notes, decision.guess, decision.scripted,
+            decision.fellBack)
           echo "fogboards: ply ", state.sim.plies, " ",
             state.sim.names[mover], " plays ",
             state.sim.cellName(decision.cell), " at ",
@@ -337,7 +342,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             if config.sense > 0 and not sensed and fallback.anchor >= 0:
               state.sim.applySense(mover, fallback.anchor)
             state.sim.applyAttempt(mover, fallback.cell, "", "", @[],
-              seatScripted, true)
+              fallback.scripted, true)
           except CatchableError as fatal:
             echo "fogboards: the baseline could not move either (",
               fatal.msg, "); ending the episode"

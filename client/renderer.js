@@ -346,7 +346,7 @@
       cellPath(ctx, fit, cell);
       ctx.fillStyle = tint;
       ctx.fill();
-      ctx.strokeStyle = "rgba(242, 232, 216, 0.22)";
+      ctx.strokeStyle = "rgba(242, 232, 216, 0.34)";
       ctx.lineWidth = 1;
       ctx.stroke();
     }
@@ -355,7 +355,7 @@
 
   function drawCaption(ctx, box, text, colour, hudscale) {
     ctx.save();
-    ctx.font = "700 " + Math.round(Math.max(9, 12 * hudscale)) + "px " +
+    ctx.font = "700 " + Math.round(Math.max(10, 13 * hudscale)) + "px " +
       BOARD_FONT;
     ctx.textAlign = "center";
     ctx.textBaseline = "bottom";
@@ -380,11 +380,14 @@
       ctx.fillText(String.fromCharCode(97 + col), bottom.x,
         bottom.y + cellRadius(fit) * 0.85);
     }
+    // The ranks go in a straight column OUTSIDE the rhombus: on a leaning
+    // board, hanging each digit off its own row's first cell walks them
+    // into the board and over the edge strip.
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
     for (var row = 0; row < size; row++) {
       var left = centreOf(fit, row * size);
-      ctx.fillText(String(row + 1), left.x - cellRadius(fit) * 0.95, left.y);
+      ctx.fillText(String(row + 1), fit.x - px * 0.25, left.y);
     }
     ctx.restore();
   }
@@ -395,7 +398,7 @@
     // never be laid out past the edge of the canvas.
     var fit = fitBoard({ x: box.x + box.w * 0.06, y: box.y,
       w: box.w * 0.92, h: box.h * 0.9 }, size, state.mode);
-    drawGrid(ctx, fit, "rgba(242, 232, 216, 0.07)");
+    drawGrid(ctx, fit, "rgba(242, 232, 216, 0.17)");
     drawEdges(ctx, fit);
     var proven = cellSet(size,
       ((state.seats || [])[state.mover] || {}).known);
@@ -504,7 +507,7 @@
     var fit = fitBoard(box, size, state.mode);
     var view = (state.seats || [])[seat] || {};
     var mine = occupantName(seat);
-    drawGrid(ctx, fit, "rgba(242, 232, 216, 0.05)");
+    drawGrid(ctx, fit, "rgba(242, 232, 216, 0.11)");
     drawEdges(ctx, fit);
     var known = cellSet(size, view.known);
     var guessed = cellSet(size, view.guess);
@@ -577,7 +580,7 @@
       ctx.fillStyle = "#16110d";
     }
     ctx.fillRect(0, 0, w, h);
-    ctx.fillStyle = "rgba(18, 13, 9, 0.45)";
+    ctx.fillStyle = "rgba(18, 13, 9, 0.38)";
     ctx.fillRect(0, 0, w, h);
     if (!state.board || !state.size) return;
     var boxes = viewports(w, h, hudscale);

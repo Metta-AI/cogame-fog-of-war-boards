@@ -34,21 +34,23 @@
 -->
 <style>
   html, body { margin: 0; height: 100%; background: #120d09; color: #f2e8d8;
-    font-family: system-ui, sans-serif; }
-  #wrap { display: flex; height: 100%; }
-  #frame-holder { flex: none; border-right: 1px solid rgba(242,232,216,0.2); }
-  iframe { border: 0; display: block; }
-  #scratch { flex: 1; min-width: 0; }
+    font-family: system-ui, sans-serif; overflow: hidden; }
+  /* The scratch canvas is the full frame and sits UNDER the iframe, so a
+     text run transcribed at the geometry the page laid it out with lands
+     at the same place on this canvas -- which is what makes
+     --strict-text-bounds mean something. */
+  #scratch { position: fixed; inset: 0; width: 100%; height: 100%;
+    z-index: 0; }
+  iframe { position: fixed; left: 0; top: 0; border: 0; height: 100%;
+    z-index: 1; }
   #report { position: fixed; right: 8px; bottom: 8px; font-size: 11px;
-    background: rgba(18,13,9,0.9); padding: 6px 8px; max-width: 46%;
+    background: rgba(18,13,9,0.92); padding: 6px 8px; max-width: 40%;
     white-space: pre-wrap; z-index: 5; }
 </style>
 </head>
 <body>
-<div id="wrap">
-  <div id="frame-holder"><iframe id="stage" width="1280" height="800"></iframe></div>
-  <canvas id="scratch" width="520" height="800"></canvas>
-</div>
+<canvas id="scratch" width="1400" height="900"></canvas>
+<iframe id="stage" width="1280"></iframe>
 <div id="report">fixture: starting…</div>
 <script>
 (function () {
@@ -191,8 +193,24 @@
   // Only the wasm entry is replaced. Everything else in the iframe is the
   // shipped bundle, byte for byte.
   function shimSource(payload) {
+    // THE ONLY THING SHIMMED IS WHERE THE REPLAY COMES FROM.
+    //   * FogReplayModule: the payload is handed over from memory instead
+    //     of being re-derived by the wasm module, so this fixture needs no
+    //     emsdk and stays about the TEXT.
+    //   * URLSearchParams: an about:srcdoc document has no query string, and
+    //     the shipped shell reads ?replay= from one.
+    //   * window.parent: the smoke's init script replaces `parent` in every
+    //     frame, so without this the inner shell's own `ready`/`error`
+    //     bridge would answer the harness and this fixture's checks would
+    //     never decide anything. The shell's own guard is
+    //     `if (window.parent === window) return;`.
     var json = JSON.stringify(payload).replace(/</g, "\\u003c");
     return "<script>(function(){var text=" + JSON.stringify(json) + ";" +
+      "try{window.parent=window;}catch(ignore){}" +
+      "var Real=window.URLSearchParams;" +
+      "window.URLSearchParams=function(init){var p=new Real(init);" +
+      "if(!p.get('replay')){p.set('replay','data:application/json,%7B%7D');}" +
+      "return p;};" +
       "var bytes=new TextEncoder().encode(text);" +
       "var heap=new Uint8Array(4194304);var at=1048576;heap.set(bytes,at);" +
       "window.FogReplayModule=function(){return Promise.resolve({" +
@@ -259,10 +277,19 @@
         ctx.textAlign = "left";
         ctx.textBaseline = "top";
         ctx.fillStyle = "rgba(242,232,216,0.85)";
-        // Same size, same font, placed inside this document's canvas at the
-        // measured offset from the frame's own origin.
-        var x = Math.min(box.left, scratch.width - 4);
-        var y = Math.min(box.top, scratch.height - 4);
+        // Same size, same font, at the offset the page laid it out with —
+        // clamped so the run itself always fits the canvas. A run that
+        // cannot fit at all is the failure this fixture is looking for, and
+        // it is reported as one rather than smuggled in as a bounds miss.
+        var width = ctx.measureText(text).width;
+        var lineHeight = parseFloat(style.fontSize) || 12;
+        if (width > scratch.width - 4) {
+          clipped.push(selector + " @" + width.toFixed(0) + "px wide");
+          continue;
+        }
+        var x = Math.max(2, Math.min(box.left, scratch.width - width - 2));
+        var y = Math.max(2,
+          Math.min(box.top, scratch.height - lineHeight - 2));
         ctx.fillText(text, x, y);
         drawn += 1;
       }
@@ -274,6 +301,7 @@
     return new Promise(function (resolve) {
       iframe.width = String(width);
       iframe.style.width = width + "px";
+      iframe.style.height = (window.innerHeight || 800) + "px";
       window.setTimeout(function () { resolve(); }, 1200);
     }).then(function () {
       var doc = iframe.contentDocument;

@@ -536,7 +536,8 @@ body.feed-collapsed #feed { display: none; }
 .plate-say {
   grid-area: say;
   min-height: calc(13px * var(--hudscale));
-  max-height: calc(26px * var(--hudscale));
+  max-height: calc(40px * var(--hudscale));
+  overflow-wrap: anywhere;
   overflow: hidden;
   font-family: var(--finefont);
   font-size: calc(10px * var(--hudscale));

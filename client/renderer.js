@@ -639,6 +639,16 @@
     return Math.max(0, Math.min(1, (mine.discovered || 0) / total));
   }
 
+  // The server already caps `say` at MAX_SAY_LEN RUNES on a rune
+  // boundary, so this is normally a no-op -- but String.slice cuts on
+  // UTF-16 code units, which would split the surrogate pair of an astral
+  // character (an emoji) sitting on the cap and draw half of it.
+  function capSay(text) {
+    var runes = Array.from(text);
+    return runes.length <= MAX_SAY_LEN ? text :
+      runes.slice(0, MAX_SAY_LEN).join("");
+  }
+
   function updateScorebug(container, state, nameMap, assetBase) {
     if (!container || !state || !state.seats) return;
     var html = "";
@@ -646,7 +656,7 @@
       var alias = seat.name || ("Seat " + index);
       var policy = nameMap ? nameMap.seat(index) : (seat.policy || alias);
       var acting = !state.gameDone && state.mover === index;
-      var say = seat.say || "";
+      var say = capSay(seat.say || "");
       html += '<div class="plate ' + SEAT_CLASS[index] + '">' +
         '<img class="plate-avatar" alt="" src="' +
         assetUrl(assetBase, index === 0 ? "soldier_red_front.png" :
@@ -665,7 +675,7 @@
         '<span class="plate-fog"><span class="plate-fog-fill" style="width:' +
         Math.round(fogShare(state, index) * 100) + '%"></span></span>' +
         '<span class="plate-say">' +
-        C.escapeHtml(say.slice(0, MAX_SAY_LEN)) + "</span>" +
+        C.escapeHtml(say) + "</span>" +
         "</div>";
     });
     if (container.dataset.html !== html) {

@@ -644,9 +644,11 @@ proc boardStateJson*(sim: Sim): JsonNode =
 # ---- Event JSON -------------------------------------------------------------
 
 proc eventToJson*(event: GameEvent): JsonNode =
-  result = %*{"kind": $event.kind}
-  if event.round >= 0:
-    result["round"] = %event.round
+  ## `round` is written for EVERY event, including the opening one, whose
+  ## value is -1: design.md:594 gives `start` as {kind, round: -1}, and a
+  ## key that is present-but-negative is what `eventFromJson` and the
+  ## chrome already read (both treat a round below 0 as "no ply").
+  result = %*{"kind": $event.kind, "round": event.round}
   case event.kind
   of evStart:
     discard

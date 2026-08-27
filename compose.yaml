@@ -1,0 +1,7 @@
+services:
+  fog-of-war-boards:
+    image: coworld-fog-of-war-boards:latest
+    platform: linux/amd64
+    build:
+      context: .
+      network: host

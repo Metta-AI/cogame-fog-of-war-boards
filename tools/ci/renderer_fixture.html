@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>fog-of-war-boards — renderer text fixture</title>
+<!--
+  WORST-CASE TEXT FIXTURE.
+
+  Every replay CI produces carries ZERO LLM text: tools/ci/docker_smoke.sh
+  runs with no ANTHROPIC_API_KEY, so both seats play the scripted `probe`
+  baseline, and a scripted baseline emits no `say`, no `notes` and no
+  `guess`. Nothing that plays a CI replay therefore ever exercises the say
+  band, the quoted feed lines or the guessed-cell overlay — the three
+  places this game draws model text (cogchemists, 2026-08-24).
+
+  So this fixture loads the SHIPPED bundle — dist/static-replay-viewer/
+  index.html, the real page, the real chrome_common.js, the real
+  renderer.js — in an iframe and shims ONLY the wasm entry, then feeds it a
+  synthetic payload with a full-cap 80-rune `say` on both seats, a full
+  six-entry `guess` on every ply and the longest plausible policy names. It
+  does NOT re-implement any drawing: a fixture that re-implements the
+  drawing gates nothing (particle-worlds 46cf69d, 2026-08-26).
+
+  It drives the page at 360, 640 and 1280 px, then TRANSCRIBES the text runs
+  the page laid out — the say band, the plate names, the clock and the feed
+  lines — onto its own canvas at their measured geometry, so
+  `viewer_smoke.mjs --strict-text-bounds` sees them. It also reads the
+  iframe's own canvas-text report, so a caption or cell label drawn off the
+  board fails here too.
+
+  Run:  node tools/ci/viewer_smoke.mjs --url <fixture url> --strict-text-bounds
+  Pass: data-replay-loaded="true" on THIS document.
+  Fail: data-replay-error="<what went wrong>".
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #120d09; color: #f2e8d8;
+    font-family: system-ui, sans-serif; }
+  #wrap { display: flex; height: 100%; }
+  #frame-holder { flex: none; border-right: 1px solid rgba(242,232,216,0.2); }
+  iframe { border: 0; display: block; }
+  #scratch { flex: 1; min-width: 0; }
+  #report { position: fixed; right: 8px; bottom: 8px; font-size: 11px;
+    background: rgba(18,13,9,0.9); padding: 6px 8px; max-width: 46%;
+    white-space: pre-wrap; z-index: 5; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="frame-holder"><iframe id="stage" width="1280" height="800"></iframe></div>
+  <canvas id="scratch" width="520" height="800"></canvas>
+</div>
+<div id="report">fixture: starting…</div>
+<script>
+(function () {
+  "use strict";
+
+  var WIDTHS = [360, 640, 1280];
+  var SIZE = 5;
+  var CELLS = SIZE * SIZE;
+  var report = document.getElementById("report");
+  var iframe = document.getElementById("stage");
+  var scratch = document.getElementById("scratch");
+  var ctx = scratch.getContext("2d");
+
+  function say(text) { report.textContent = text; }
+
+  function fail(message) {
+    say("FIXTURE FAILED: " + message);
+    document.documentElement.setAttribute("data-replay-error", message);
+  }
+
+  function cellName(cell) {
+    return String.fromCharCode(97 + (cell % SIZE)) +
+      (Math.floor(cell / SIZE) + 1);
+  }
+
+  // ---- the worst case ------------------------------------------------------
+  // 80 runes exactly, which is what the server caps `say` at, in a mix of
+  // wide and narrow glyphs.
+  function fullSay(seat) {
+    var base = seat === 0 ?
+      "his chain has to cross d3 and i will sit on it until he pays for it \u2014 " :
+      "they are bridging low so i take c2 now and let them waste a ply on b4 \u2014 ";
+    var runes = Array.from(base);
+    while (runes.length < 80) runes.push("\u2026");
+    return runes.slice(0, 80).join("");
+  }
+
+  var POLICY_NAMES = ["fog-of-war-boards-cartographer",
+    "fog-of-war-boards-prober"];
+  var ALIASES = ["Sprocket", "Gizmo"];
+
+  // ---- a synthetic episode -------------------------------------------------
+  // Fixture DATA, not fixture drawing: the shipped renderer.js draws it.
+  function build() {
+    var board = [];
+    for (var i = 0; i < CELLS; i++) board.push("empty");
+    var events = [{ kind: "start", round: -1 }];
+    var states = [];
+    var known = [[], []];
+    var stones = [0, 0];
+    var probes = [0, 0];
+    var plan = [
+      [0, "c3", "placed"], [1, "c3", "occupied"], [0, "d2", "placed"],
+      [1, "b2", "placed"], [0, "b3", "placed"], [1, "b3", "occupied"],
+      [0, "e1", "placed"], [1, "b1", "placed"], [0, "a3", "placed"]
+    ];
+    function cellOf(name) {
+      return (parseInt(name.slice(1), 10) - 1) * SIZE +
+        (name.charCodeAt(0) - 97);
+    }
+    function guessFor(seat, ply) {
+      var out = [];
+      for (var g = 0; g < 6; g++) {
+        out.push(cellName((seat * 7 + ply * 3 + g * 4) % CELLS));
+      }
+      return out;
+    }
+    function snapshot(ply, mover, last, done) {
+      var seats = [];
+      for (var seat = 0; seat < 2; seat++) {
+        seats.push({
+          name: ALIASES[seat], policy: POLICY_NAMES[seat],
+          stones: stones[seat], probes: probes[seat],
+          discovered: known[seat].length,
+          distToWin: Math.max(0, 5 - stones[seat]),
+          score: 0, known: known[seat].slice(),
+          sensedEmpty: [{ cell: "a1", ply: 0 }, { cell: "e5", ply: 1 }],
+          guess: guessFor(seat, ply), say: fullSay(seat),
+          notes: "proven: " + known[seat].join(",") +
+            ". route a3-b3-c3-d3-e3, re-routed twice.",
+          scripted: false, fellBack: false
+        });
+      }
+      return {
+        mode: "dark-hex", size: SIZE, abrupt: true, sense: 0,
+        board: board.slice(), seats: seats, mover: mover, ply: ply,
+        maxPlies: 50, plies: ply, lastAttempt: last, lastSense: null,
+        winner: done ? 0 : -1,
+        winPath: done ? ["a3", "b3", "c3", "d2", "e1"] : [],
+        phase: done ? "done" : "moving", gameDone: !!done,
+        reason: done ? "complete" : "", ending: done ? "connection" : ""
+      };
+    }
+    states.push(snapshot(0, 0, null, false));
+    states.push(snapshot(0, 0, null, false));
+    plan.forEach(function (step, index) {
+      var seat = step[0];
+      var name = step[1];
+      var result = step[2];
+      if (result === "placed") {
+        board[cellOf(name)] = seat === 0 ? "seat0" : "seat1";
+        stones[seat] += 1;
+      } else {
+        known[seat].push(name);
+        probes[seat] += 1;
+      }
+      events.push({
+        kind: "attempt", round: index, seat: seat, cell: name,
+        result: result, say: fullSay(seat),
+        notes: "map rewritten on ply " + (index + 1),
+        guess: guessFor(seat, index), scripted: false, fellBack: false
+      });
+      states.push(snapshot(index + 1, 1 - seat,
+        { seat: seat, cell: name, result: result }, false));
+    });
+    events.push({ kind: "win", round: 8, seat: 0, how: "connection",
+      path: ["a3", "b3", "c3", "d2", "e1"] });
+    states.push(snapshot(9, 0, null, true));
+    events.push({ kind: "end", round: 9, reason: "complete",
+      ending: "connection", scores: [1, -1] });
+    states.push(snapshot(9, 0, null, true));
+    return {
+      type: "replay", protocol: "fogboards.replay.v1", names: ALIASES,
+      policyNames: POLICY_NAMES,
+      config: { mode: "dark-hex", size: SIZE, abrupt: true, sense: 0,
+        first: 0, seed: 23, maxPlies: 50, sampled: true },
+      events: events, states: states,
+      results: {
+        names: POLICY_NAMES, scores: [1, -1], outcome: [1, 0],
+        stones: [5, 2], probes: [0, 2], discovered: [0, 2],
+        guessesMade: [30, 24], guessAccuracy: [0.4, 0.25],
+        distToWin: [0, 3], fallbacks: [0, 0], plies: 9, maxPlies: 50,
+        mode: "dark-hex", size: SIZE, abrupt: true, sense: 0,
+        ending: "connection", reason: "complete"
+      }
+    };
+  }
+
+  // ---- the shim ------------------------------------------------------------
+  // Only the wasm entry is replaced. Everything else in the iframe is the
+  // shipped bundle, byte for byte.
+  function shimSource(payload) {
+    var json = JSON.stringify(payload).replace(/</g, "\\u003c");
+    return "<script>(function(){var text=" + JSON.stringify(json) + ";" +
+      "var bytes=new TextEncoder().encode(text);" +
+      "var heap=new Uint8Array(4194304);var at=1048576;heap.set(bytes,at);" +
+      "window.FogReplayModule=function(){return Promise.resolve({" +
+      "HEAPU8:heap,_malloc:function(){return 16;},_free:function(){}," +
+      "_fog_load_replay:function(){return 1;}," +
+      "_fog_payload_ptr:function(){return at;}," +
+      "_fog_payload_len:function(){return bytes.length;}," +
+      "_fog_error_ptr:function(){return 0;}," +
+      "_fog_error_len:function(){return 0;}});};})();<\/script>";
+  }
+
+  function load(payload) {
+    return fetch("index.html").then(function (response) {
+      if (!response.ok) throw new Error("index.html " + response.status);
+      return response.text();
+    }).then(function (html) {
+      if (html.indexOf('src="./fogboards_replay.js"') < 0) {
+        throw new Error("the shipped index.html no longer loads " +
+          "./fogboards_replay.js; the shim would not bite");
+      }
+      var patched = html
+        .replace('<script src="./fogboards_replay.js"></' + "script>",
+          shimSource(payload))
+        .replace("<head>", '<head><base href="./">');
+      return new Promise(function (resolve, reject) {
+        iframe.onload = function () { resolve(); };
+        iframe.onerror = function () { reject(new Error("iframe failed")); };
+        iframe.srcdoc = patched;
+        window.setTimeout(function () { resolve(); }, 8000);
+      });
+    });
+  }
+
+  // ---- transcription -------------------------------------------------------
+  // The text the page LAID OUT, redrawn on this document's canvas at the
+  // geometry it was laid out with, so the smoke's fillText instrumentation
+  // and --strict-text-bounds apply to it.
+  var SELECTORS = ["#clock", ".plate-name", ".plate-alias", ".plate-score",
+    ".plate-label", ".plate-say", ".feed-line", ".end-verdict", ".end-cell"];
+
+  function transcribe(width) {
+    var doc = iframe.contentDocument;
+    if (!doc) throw new Error("no iframe document");
+    var drawn = 0;
+    var clipped = [];
+    SELECTORS.forEach(function (selector) {
+      var nodes = doc.querySelectorAll(selector);
+      for (var i = 0; i < nodes.length && i < 24; i++) {
+        var node = nodes[i];
+        var text = (node.innerText || node.textContent || "").trim();
+        if (!text) continue;
+        var box = node.getBoundingClientRect();
+        if (!box.width || !box.height) continue;
+        var style = getComputedStyle(node);
+        // A text run whose content is taller than the box it was given has
+        // nowhere to go: that is the failure the reserved say band exists
+        // to make impossible.
+        if (node.scrollHeight > node.clientHeight + 2 &&
+            style.overflow === "hidden") {
+          clipped.push(selector + " @" + width + "px");
+        }
+        ctx.font = style.fontWeight + " " + style.fontSize + " " +
+          style.fontFamily;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "top";
+        ctx.fillStyle = "rgba(242,232,216,0.85)";
+        // Same size, same font, placed inside this document's canvas at the
+        // measured offset from the frame's own origin.
+        var x = Math.min(box.left, scratch.width - 4);
+        var y = Math.min(box.top, scratch.height - 4);
+        ctx.fillText(text, x, y);
+        drawn += 1;
+      }
+    });
+    return { drawn: drawn, clipped: clipped };
+  }
+
+  function checkAt(width) {
+    return new Promise(function (resolve) {
+      iframe.width = String(width);
+      iframe.style.width = width + "px";
+      window.setTimeout(function () { resolve(); }, 1200);
+    }).then(function () {
+      var doc = iframe.contentDocument;
+      var problems = [];
+      if (!doc) { throw new Error("no iframe document at " + width + "px"); }
+      if (doc.documentElement.getAttribute("data-replay-error")) {
+        problems.push("the shipped shell reported " +
+          doc.documentElement.getAttribute("data-replay-error"));
+      }
+      if (doc.documentElement.getAttribute("data-replay-loaded") !== "true") {
+        problems.push("the shipped shell never drew a frame at " + width +
+          "px");
+      }
+      var says = doc.querySelectorAll(".plate-say");
+      if (says.length !== 2) {
+        problems.push("expected a say band on both plates at " + width +
+          "px, found " + says.length);
+      }
+      says.forEach(function (node) {
+        var text = (node.innerText || "").trim();
+        if (Array.from(text).length < 20) {
+          problems.push("the say band at " + width +
+            "px carried only " + Array.from(text).length + " runes");
+        }
+      });
+      var quoted = 0;
+      doc.querySelectorAll(".feed-say").forEach(function (node) {
+        if ((node.innerText || "").indexOf("\u201c") >= 0) quoted += 1;
+      });
+      if (!quoted) {
+        problems.push("no quoted say line in the feed at " + width + "px");
+      }
+      var names = doc.querySelectorAll(".plate-name");
+      names.forEach(function (node) {
+        if (node.getBoundingClientRect().width < 24) {
+          problems.push("a policy name collapsed at " + width + "px");
+        }
+      });
+      var run = transcribe(width);
+      if (!run.drawn) {
+        problems.push("nothing was laid out to transcribe at " + width +
+          "px");
+      }
+      run.clipped.forEach(function (where) {
+        problems.push("text is clipped by its own box: " + where);
+      });
+      // The iframe's own canvas draws are instrumented too (the smoke's
+      // init script runs in every frame), so a caption or cell label with
+      // nowhere to go fails here as well.
+      var bounds = iframe.contentWindow.__coworldTextBounds;
+      if (bounds && bounds.report) {
+        var canvasText = bounds.report();
+        if (canvasText && canvasText.never_inside > 0) {
+          problems.push(canvasText.never_inside + " canvas string(s) were " +
+            "NEVER drawn inside the board canvas at " + width + "px");
+        }
+      }
+      return problems;
+    });
+  }
+
+  var payload = build();
+  say("fixture: loading the shipped bundle…");
+  load(payload).then(function () {
+    var problems = [];
+    return WIDTHS.reduce(function (chain, width) {
+      return chain.then(function () {
+        say("fixture: checking " + width + "px…");
+        return checkAt(width).then(function (found) {
+          problems = problems.concat(found);
+        });
+      });
+    }, Promise.resolve()).then(function () { return problems; });
+  }).then(function (problems) {
+    if (problems.length) {
+      fail(problems.join(" | "));
+      return;
+    }
+    say("fixture OK: 360 / 640 / 1280 px, full-cap say on both seats, six " +
+      "guesses per ply, nothing clipped");
+    document.documentElement.setAttribute("data-replay-loaded", "true");
+  }).catch(function (error) {
+    fail(String(error && error.message || error));
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+[
+  {
+    "name": "fog-of-war-boards-cartographer",
+    "run": "/bin/fog-of-war-boards-player",
+    "env": {
+      "PLAYER_PROMPT": "Keep a map, and rewrite it in your notes every single ply. Your notes are the only memory you have: list YOUR stones, the opponent stones you have PROVEN, and the cells you have never touched, and mark each untouched cell as likely-theirs or likely-empty with a reason. HEX: play the cell that shortens your own chain the most, and prefer a cell that also sits on their shortest path — one stone that builds and blocks is worth two that only build. Treat a collision as a gift, not a loss: you just bought a certainty, so immediately re-route your chain around it and write the new route down. Never attempt a cell you have already proven is theirs. TIC-TAC-TOE: take the centre if it is untouched, then build two threats at once; if you have two in a line and the third cell is untouched, take it now. When you sense, point the window where your route crosses ground you have never seen."
+    }
+  },
+  {
+    "name": "fog-of-war-boards-prober",
+    "run": "/bin/fog-of-war-boards-player",
+    "env": {
+      "PLAYER_PROMPT": "Spend moves on information early and on connection late. Count the plies: in the first third of the board, deliberately attempt cells on the opponent's most natural route — a collision costs you a stone but tells you exactly where they are building, and in the abrupt variants it tells you they wasted nothing. In the last third, stop probing entirely and take the shortest remaining route to your own edges. Model them out loud in your notes: they are trying to connect the opposite pair of sides, so their stones lie near the straight line between their edges — say which cells that predicts and put those cells in your `guess` list every ply so your reasoning is on the record. HEX: bridge with a gap when you can — two stones a knight's step apart are hard to cut. When you sense, point the window at the middle of their predicted route, not at your own stones."
+    },
+    "player": "ply_bac48eb1-662e-44f8-973d-f3e016dccf5d"
+  },
+  {
+    "name": "fog-of-war-boards-probe",
+    "run": "/bin/fog-of-war-boards-player",
+    "env": {
+      "PLAYER_SCRIPTED": "probe"
+    }
+  },
+  {
+    "name": "fog-of-war-boards-sweep",
+    "run": "/bin/fog-of-war-boards-player",
+    "env": {
+      "PLAYER_SCRIPTED": "sweep"
+    }
+  }
+]

@@ -1,0 +1,23 @@
+# Builds the static wasm replay viewer with a pinned Nim + emsdk toolchain.
+# Used by tools/build_replay_viewer.sh when no local emcc is available; the
+# output is architecture-neutral WebAssembly.
+FROM emscripten/emsdk:4.0.15 AS replay-viewer-builder
+
+RUN apt-get update && \
+  apt-get install -y --no-install-recommends ca-certificates curl git && \
+  rm -rf /var/lib/apt/lists/* && \
+  curl -fsSL \
+    -o /usr/local/bin/nimby \
+    https://github.com/treeform/nimby/releases/download/0.1.27/nimby-Linux-X64 && \
+  chmod +x /usr/local/bin/nimby && \
+  nimby use 2.2.4
+
+ENV PATH="/root/.nimby/nim/bin:$PATH"
+
+WORKDIR /workspace/fogboards
+COPY . .
+# The wasm module only uses the Nim stdlib plus fogboards/sim, so no
+# package sync is needed. Drop the host machine's package paths.
+RUN rm -f nim.cfg && \
+  nim c --hints:off -d:emscripten replay-viewer/fogboards_replay.nim && \
+  test -s replay-viewer/dist/fogboards_replay.wasm

@@ -1,0 +1,552 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Metta-AI/coworld/main/src/coworld/coworld_manifest_schema.json",
+  "tags": [
+    "imperfect-information",
+    "board-game",
+    "zero-sum",
+    "two-player",
+    "turn-based",
+    "llm-driven",
+    "openspiel-port",
+    "hex",
+    "tic-tac-toe",
+    "belief-tracking"
+  ],
+  "episode_timeout_minutes": 20,
+  "game": {
+    "name": "fog-of-war-boards",
+    "description": "Fog-of-War Boards: Phantom Tic-Tac-Toe and Dark Hex for two LLM-piloted cogs. Two seats, one board, and the only channel through which a seat ever learns anything about its opponent is the referee's answer to its own move: you name a cell, and the referee says PLACED or OCCUPIED. Everything else - where their stones are, how many they hold, what they are planning - is fog. Four variants ship: Phantom Tic-Tac-Toe on 3x3, classical Dark Hex on 4x4, Abrupt Dark Hex on 5x5 (where a collision ENDS your turn, so a fact costs you a move), and Reconnaissance Dark Hex on 5x5, an original variant that transplants Reconnaissance Blind Chess's sense-then-move loop onto Abrupt Dark Hex: each ply the mover first names a 2x2 window and is told the truth about those four cells, then moves. Seat 0 (red) links the left file to the right file; seat 1 (blue) links the bottom rank to the top rank; in tic-tac-toe a seat wins by owning one of the eight lines. Zero-sum: +1 to the winner, -1 to the loser, 0 each on a draw. Because a stone once placed never moves and is never removed, a seat's knowledge is monotone - anything the referee has ever told you stays true forever - and the whole skill is belief tracking on rules a cog already knows cold. The game is LLM-driven: the server sends the acting seat's policy prompt plus that seat's OWN view of the board to Claude, so A POLICY IS JUST A PROMPT - build one by reusing the published player runnable and setting the PLAYER_PROMPT environment variable. Two scripted baselines (probe, a shortest-path chain builder; sweep, a corridor walker) play any seat that registers as scripted - and every seat when no LLM credentials are available, so episodes always complete. Spectators see the true board flanked by each seat's belief overlay: the gap between them is the show.",
+    "owner": "daveey@gmail.com",
+    "replay_viewer": {
+      "bundle": "static-replay-viewer"
+    },
+    "runnable": {
+      "type": "game",
+      "image": "{{FOG_OF_WAR_BOARDS_IMAGE}}",
+      "run": [
+        "/bin/fog-of-war-boards"
+      ],
+      "env": {
+        "ANTHROPIC_API_KEY_URI": "secret://coworld/fog-of-war-boards/anthropic_api_key"
+      },
+      "source_url": "https://github.com/Metta-AI/cogame-fog-of-war-boards/tree/main"
+    },
+    "config_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tokens",
+        "players"
+      ],
+      "properties": {
+        "tokens": {
+          "description": "One connection token per player slot, indexed by slot. Injected by the runner; never present in a shipped game_config.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "players": {
+          "description": "One player display-name object per seat, indexed by slot.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "num_agents": {
+          "description": "Seat count; injected by the commissioner. Fog-of-War Boards is a two-player zero-sum board game.",
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 2
+        },
+        "mode": {
+          "description": "Which board: phantom-ttt (3x3 tic-tac-toe) or dark-hex (an n x n hex rhombus).",
+          "type": "string",
+          "enum": [
+            "phantom-ttt",
+            "dark-hex"
+          ],
+          "default": "dark-hex"
+        },
+        "size": {
+          "description": "Board edge length. phantom-ttt is always 3; the shipped hex variants are 4 and 5.",
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 7,
+          "default": 5
+        },
+        "abrupt": {
+          "description": "true: a collision ends the mover's turn. false: the mover plays again, one cell wiser.",
+          "type": "boolean",
+          "default": true
+        },
+        "sense": {
+          "description": "Reconnaissance window edge, 0 for none. 2 gives the mover a truthful 2x2 window each ply before it moves.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3,
+          "default": 0
+        },
+        "first": {
+          "description": "The seat that moves on ply 0.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0
+        },
+        "maxPlies": {
+          "description": "Hard ply cap. The rules bound an episode at 2 x size x size plies; the cap is fitted to that at sample time.",
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 120,
+          "default": 50
+        },
+        "seed": {
+          "description": "Pins the seat aliases and the scripted baselines' tie-breaks. Omit for a fresh random seed per episode.",
+          "type": "integer"
+        },
+        "episodeTimeoutSeconds": {
+          "description": "Wall-clock the game assumes the platform allows an episode when COWORLD_TIMEOUT_SECONDS is not in its environment; a ply that cannot finish inside 60% of it is never opened, and the episode settles on distance instead.",
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 6000,
+          "default": 1200
+        },
+        "plySpacingSeconds": {
+          "description": "Minimum wall-clock between the starts of two LLM-driven plies. 0 derives 4 s, the Bedrock sidecar's 30-requests-per-minute floor at two requests per ply.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60,
+          "default": 0
+        },
+        "turnDelayMs": {
+          "description": "Spectator pacing delay after every ply.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000,
+          "default": 250
+        },
+        "model": {
+          "description": "Claude model that drives every LLM seat.",
+          "type": "string",
+          "default": "claude-sonnet-5"
+        },
+        "maxOutputTokens": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 2000,
+          "default": 900
+        },
+        "llmTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 300,
+          "default": 30
+        },
+        "player_connect_timeout_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "default": 180
+        }
+      }
+    },
+    "results_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "names",
+        "scores",
+        "outcome",
+        "stones",
+        "probes",
+        "discovered",
+        "guessesMade",
+        "guessAccuracy",
+        "distToWin",
+        "fallbacks",
+        "plies",
+        "maxPlies",
+        "mode",
+        "size",
+        "abrupt",
+        "sense",
+        "ending",
+        "reason"
+      ],
+      "properties": {
+        "names": {
+          "description": "Policy display names, indexed by slot. Seats play under anonymous cog aliases in-game; results attribute by policy name.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "string"
+          }
+        },
+        "scores": {
+          "description": "Zero-sum outcome: +1 for the winner, -1 for the loser, 0 each on a draw. The league ranks by mean episode score, higher first.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "number",
+            "minimum": -1,
+            "maximum": 1
+          }
+        },
+        "outcome": {
+          "description": "The same verdict on the 1 / 0.5 / 0 scale.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "stones": {
+          "description": "Stones the seat placed.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "probes": {
+          "description": "Collisions the seat caused: plies it spent naming a cell that already held an opponent stone.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "discovered": {
+          "description": "Opponent cells the seat had PROVEN when the episode ended.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "guessesMade": {
+          "description": "Cells the seat named in its guess lists over the episode. Never scored.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "guessAccuracy": {
+          "description": "Share of the seat's guesses that named a real opponent stone. Never scored.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "distToWin": {
+          "description": "The seat's final TRUE distance to its own connection or line; 99 means no route survives.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99
+          }
+        },
+        "fallbacks": {
+          "description": "Plies on which the seat's LLM reply could not be used and the scripted baseline moved instead.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "plies": {
+          "description": "Plies actually played.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxPlies": {
+          "description": "The episode's ply cap after fitting.",
+          "type": "integer",
+          "minimum": 4
+        },
+        "mode": {
+          "description": "Which board was played.",
+          "type": "string",
+          "enum": [
+            "phantom-ttt",
+            "dark-hex"
+          ]
+        },
+        "size": {
+          "description": "Board edge length.",
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 7
+        },
+        "abrupt": {
+          "description": "Whether a collision ended the mover's turn.",
+          "type": "boolean"
+        },
+        "sense": {
+          "description": "Reconnaissance window edge, 0 for none.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "ending": {
+          "description": "The finer ending under `reason`.",
+          "type": "string",
+          "enum": [
+            "connection",
+            "line",
+            "board-full",
+            "ply-cap",
+            "wall-clock"
+          ]
+        },
+        "reason": {
+          "description": "How the episode ended: complete (a terminal position or the ply cap) or deadline (the play clock stopped it between plies; the episode is still fully scored on the true distances).",
+          "type": "string",
+          "enum": [
+            "complete",
+            "deadline"
+          ]
+        }
+      }
+    },
+    "protocols": {
+      "player": {
+        "type": "text",
+        "value": "fogboards.player.v1 - JSON text frames over the websocket named by COWORLD_PLAYER_WS_URL (already carrying ?slot=N&token=T). A Fog-of-War Boards policy is just a prompt: reuse the published player runnable with PLAYER_PROMPT, or PLAYER_SCRIPTED=probe|sweep for a baseline. The player container's only job is to deliver its prompt; the game server makes every decision by sending that prompt plus the acting seat's own view (its stones, the opponent stones it has PROVEN, its referee log, its private notes) to Claude. game->player frames: {\"type\":\"welcome\",\"protocol\":\"fogboards.player.v1\",\"slot\":N,\"name\":\"<alias>\",\"seats\":2,\"mode\":\"dark-hex\",\"size\":5,\"abrupt\":true,\"sense\":0,\"maxPlies\":50} on connect; {\"type\":\"state\",\"slot\":N,\"name\":\"<alias>\",\"ply\":p,\"maxPlies\":M,\"mode\":str,\"seat\":{score,stones,discovered,probes,distToWin,fallbacks},\"toMove\":bool,\"started\":bool,\"done\":bool,\"reason\":str,\"ending\":str} after every event - REDACTED to the seat's own tallies: it carries no board, no cell list, and nothing about the opponent beyond what this seat has proven, and its distToWin is the seat's BELIEVED distance. Decisions are server-side, so this loses a policy nothing. {\"type\":\"final\",\"done\":true,\"slot\":N,\"scores\":[...],\"outcome\":[...],\"names\":[<aliases>],\"plies\":k,\"reason\":str,\"ending\":str} at episode end, after which the player should exit. player->game frames: {\"type\":\"prompt\",\"prompt\":str,\"scripted\":\"probe\"|\"sweep\"|true|false} - send on connect and again after welcome (the first send can race slot registration); the latest frame wins; prompts over 4000 characters are truncated on a rune boundary. The server's reply contract to Claude is {\"cell\":\"c4\",\"sense\":\"b3\",\"guess\":[\"d3\",\"d4\"],\"say\":\"...\",\"notes\":\"...\"}: cell must be one of the seat's legal attempts, sense is required only where the variant has reconnaissance, guess is at most 6 cell names and is never a reason to reject a reply, say is 80 characters for the spectators and notes 400 characters handed back to their author only."
+      },
+      "global": {
+        "type": "text",
+        "value": "Global spectators connect a websocket to /global and receive the whole snapshot as JSON after every event: {\"type\":\"state\",\"game\":\"fog-of-war-boards\",\"mode\":str,\"size\":int,\"abrupt\":bool,\"sense\":int,\"board\":[\"empty\"|\"seat0\"|\"seat1\", size*size row-major from rank 1] (the TRUTH, spectators only),\"seats\":[{name, policy, stones, probes, discovered, distToWin, score, known:[cell], sensedEmpty:[{cell,ply}], guess:[cell], say, notes, scripted, fellBack} x2],\"mover\":int,\"ply\":int,\"maxPlies\":int,\"plies\":int,\"lastAttempt\":{seat,cell,result},\"lastSense\":{seat,anchor},\"winner\":int,\"winPath\":[cell],\"phase\":\"sensing\"|\"moving\"|\"done\",\"gameDone\":bool,\"reason\":str,\"ending\":str,\"policyNames\":[...],\"events\":[{kind:start|sense|attempt|win|end,...}],\"started\":bool,\"connected\":[bool,bool]}. Cells are algebraic strings (\"c3\"), never indices. The events array is append-only and carries the complete transcript. Three browser pages ship with the game: /client/global renders the live table, /client/player renders one seat's redacted view, and /client/replay plays a recorded episode. Hosted replays are the STATIC wasm bundle (index.html?replay=<url>), never a pod."
+      }
+    },
+    "docs": {
+      "readme": {
+        "type": "text",
+        "value": "Fog-of-War Boards is two cogs, one board, and no sight of the enemy. Phantom Tic-Tac-Toe and Dark Hex: you see only your own stones, and the only way you ever learn where an opponent stone is, is by naming that cell yourself and being told OCCUPIED. In the abrupt variants that collision ends your turn, so every fact costs you a move; in the classical ones you move again, one cell wiser. Reconnaissance Dark Hex adds a 2x2 sense window each ply, and it is the only variant where knowing a cell is EMPTY goes stale. Zero-sum, +1/0/-1, and the league ranks by mean episode score. A policy is just a prompt: field one by reusing the published fog-of-war-boards-player runnable with PLAYER_PROMPT set to your strategy, or PLAYER_SCRIPTED=probe|sweep to field one of the two built-in baselines. With no LLM credentials every seat plays probe, so episodes and offline certification always complete."
+      },
+      "pages": [
+        {
+          "id": "rules.md",
+          "title": "rules.md",
+          "content": {
+            "type": "text",
+            "value": "# Fog-of-War Boards rules\n\n## The board and the coordinates\n\nCells are named in algebraic notation: files `a`, `b`, `c`, ... left to right; ranks `1`, `2`,\n`3`, ... bottom to top. A 5x5 board runs `a1`..`e5`. Nothing spectator-facing ever shows an\ninternal index: the feed says `plays c3`, never `plays 12`.\n\n**Phantom Tic-Tac-Toe** (`mode: \"phantom-ttt\"`, `size: 3`). Seat 0 is X (red), seat 1 is O (blue).\nA seat wins by owning all three cells of one of the eight lines (3 rows, 3 columns, 2 diagonals).\nA full board with no line is a draw.\n\n**Dark Hex** (`mode: \"dark-hex\"`, `size` 4 or 5). An n x n rhombus of hexagons. Cell `(r, c)` is\nadjacent to `(r, c-1)`, `(r, c+1)`, `(r-1, c)`, `(r+1, c)`, `(r-1, c+1)` and `(r+1, c-1)`. Seat 0\n(red) connects the left file to the right file; seat 1 (blue) connects the bottom rank to the top\nrank. Hex has no draws: on a full board exactly one of those two connections exists.\n\nSeat 0 always moves first, and `config.first = 0` is recorded in the replay.\n\n## A ply is one attempt\n\nThe atomic unit is a **ply**: one seat naming one cell, preceded in `recon-hex-5` by one sense\nanchor.\n\n- **Non-abrupt** (`abrupt: false`): a ply that hits an opponent stone (a *collision*) does NOT end\n  the mover's turn - the same seat moves again on the next ply, now knowing one more cell.\n- **Abrupt** (`abrupt: true`): a collision ENDS the turn. The seat has spent its move to buy one\n  fact.\n\nA seat may never attempt a cell it already knows is occupied, nor one of its own stones, nor an\noff-board cell. Those are not game actions; they are invalid replies. That is also what bounds the\nepisode: collisions by a seat are at most one per opponent stone, so\n`plies <= cells (placements) + cells (collisions) = 2 x cells`, which is exactly the `maxPlies`\npinned per variant (18, 32, 50, 50).\n\n## Resolution order for ply p (0-based)\n\n1. **beginPly.** The mover is seat 0 on ply 0; thereafter the previous mover again if the previous\n   ply was a collision AND the variant is not abrupt, otherwise the other seat.\n2. **Wall-clock guard.** If `now + worstPlySeconds > playDeadline`, settle `deadline` /\n   `wall-clock` and stop. Checked here, BEFORE any observation is built, so the episode never\n   stops mid-ply.\n3. **Build the mover's observation** - its own stones, the opponent stones it has proven, its\n   referee log, its notes, and its legal attempts (and legal sense anchors), produced by the same\n   procs the validator applies.\n4. **Decide.** A scripted seat is decided inline by its baseline; an LLM seat gets one call\n   bounded by `llmTimeoutSeconds`.\n5. **Parse + legality probe** on a COPY of the sim. Invalid, unparseable or timed-out gets one\n   retry carrying the printed legal set, then falls back to the `probe` baseline.\n6. **Sense** (only when `sense > 0`): the referee truthfully reveals the sense x sense block at the\n   anchor to the mover only. Opponent stones become permanent knowledge; emptiness is timestamped,\n   because it perishes.\n7. **Attempt.** An empty cell places the mover's stone (`result: \"placed\"`); a cell holding an\n   opponent stone places NOTHING, adds the cell to the mover's proven set and counts a probe\n   (`result: \"occupied\"`).\n8. **Record and emit** the already-truncated `say`, `notes` and `guess` with the attempt event.\n9. **Win check** (only after a placement). Hex: the mover's two edges in one component of its own\n   stones - emit `win` carrying the connecting path and settle `complete` / `connection`.\n   Tic-tac-toe: the placed cell completes one of the eight lines - emit `win` carrying the three\n   cells and settle `complete` / `line`.\n10. **Turn transfer.** A placement always flips the mover; a collision flips it only when the\n    variant is abrupt.\n11. **Board-full check** (tic-tac-toe only): no empty cell remains and no line was made - settle\n    `complete` / `board-full`.\n12. `plies += 1`; at `maxPlies`, settle `complete` / `ply-cap`.\n13. **Pace**, then continue at 1.\n\n## distToWin\n\nOne number per seat, recomputed after every ply. Hex: the minimum number of ADDITIONAL cells the\nseat must own to complete its connection, as a 0-1 BFS from its source edge to its target edge\nwhere a cell it owns costs 0, an empty cell costs 1 and an opponent cell is impassable.\nTic-tac-toe: the minimum over lines the opponent has not touched of (3 - the seat's marks in that\nline). Unreachable is the sentinel 99. It is computed twice, on two different boards: on the TRUE\nboard for the scorebug, the endcard, the results and the non-terminal scoring rule, and on the\nseat's BELIEVED board for that seat's own prompt. A seat is never told the true value.\n\n## Scoring\n\n`score = +1` if the seat won, `0` on a draw, `-1` if it lost; the array always sums to zero.\nHigher is better and the league ranks by mean episode score. No other field is a ranking metric:\n`probes`, `discovered`, `guessesMade`, `guessAccuracy` and `distToWin` are reported for the audit\nand the audience and are deliberately not scored, so no policy can farm the metric instead of\nwinning.\n\n## Endings\n\n`results.reason` has exactly two legal values, `complete` and `deadline`. The finer ending rides in\na separate field, `results.ending`:\n\n| reason | ending | when | winner |\n|---|---|---|---|\n| complete | connection | Dark Hex: a seat linked its two edges | that seat |\n| complete | line | Phantom Tic-Tac-Toe: a seat completed a line | that seat |\n| complete | board-full | every cell taken and no line exists | lower true distToWin; equal is a draw |\n| complete | ply-cap | maxPlies plies with no terminal position | lower true distToWin; equal is a draw |\n| deadline | wall-clock | the play deadline stopped the episode between plies | lower true distToWin; equal is a draw |\n\nA `deadline` ending is an acceptable, fully scored result for this coworld, not a discarded one:\nthe episode is scored at the stop by the true distance. It should nonetheless be rare - the\nexpected episode uses under a fifth of the play budget.\n\n## recon-hex-5 is an original variant, not a port\n\n`phantom-ttt-3`, `dark-hex-4` and `dark-hex-5` are ports of OpenSpiel's `phantom_ttt`, `dark_hex`\nand `abrupt_dark_hex`. `recon-hex-5` is NOT a port of OpenSpiel `rbc`: it is Abrupt Dark Hex 5x5\nwith Reconnaissance Blind Chess's sense-then-move loop transplanted onto it, which is the only way\nto carry that loop without a complete chess engine. It ships as an original variant and is\nlabelled as one everywhere.\n\n## The meta\n\nEvery decision is made by Claude acting on a per-seat policy prompt plus that seat's own view.\nPrompts that keep an explicit map in their notes, treat a collision as a bought certainty and\nimmediately re-route around it, and prefer cells that both build their own chain and sit on the\nopponent's shortest path tend to score. The two scripted baselines - `probe`, a shortest-path\nchain builder that probes as a side effect, and `sweep`, a corridor walker that shifts one lane\nevery time it is blocked - fill seats without prompts and are fieldable policies in their own\nright."
+          }
+        }
+      ]
+    }
+  },
+  "player": [
+    {
+      "id": "fog-of-war-boards-player",
+      "type": "player",
+      "name": "Fog-of-War Boards Prompt Player",
+      "description": "The reference policy: delivers its PLAYER_PROMPT (or a default belief-tracking strategy) to the game and spectates until the final frame. Every decision is made server-side by Claude from that prompt plus the seat's own fogged view. Field your own policy by uploading this same image with a different PLAYER_PROMPT.",
+      "image": "{{FOG_OF_WAR_BOARDS_IMAGE}}",
+      "run": [
+        "/bin/fog-of-war-boards-player"
+      ],
+      "resources": {
+        "requests": {
+          "cpu": "100m",
+          "memory": "64Mi"
+        },
+        "limits": {
+          "cpu": "1"
+        }
+      },
+      "source_url": "https://github.com/Metta-AI/cogame-fog-of-war-boards/tree/main"
+    },
+    {
+      "id": "fog-of-war-boards-scripted",
+      "type": "player",
+      "name": "Fog-of-War Boards Scripted Prober",
+      "description": "The `probe` baseline as a fieldable policy: registers its seat as rule-based (a shortest-path chain builder on the board as it believes it to be, which probes the opponent as a side effect) so the game server plays it deterministically, no LLM involved.",
+      "image": "{{FOG_OF_WAR_BOARDS_IMAGE}}",
+      "run": [
+        "/bin/fog-of-war-boards-player"
+      ],
+      "env": {
+        "PLAYER_SCRIPTED": "probe"
+      },
+      "resources": {
+        "requests": {
+          "cpu": "100m",
+          "memory": "64Mi"
+        },
+        "limits": {
+          "cpu": "1"
+        }
+      },
+      "source_url": "https://github.com/Metta-AI/cogame-fog-of-war-boards/tree/main"
+    }
+  ],
+  "variants": [
+    {
+      "id": "phantom-ttt-3",
+      "name": "Phantom Tic-Tac-Toe - 3x3",
+      "description": "OpenSpiel phantom_ttt. Two cogs, one 3x3 grid, and neither can see the other's marks. A collision does not end your turn, so every blocked cell is a free fact - and the board is small enough that a whole game is an inference exercise.",
+      "game_config": {
+        "mode": "phantom-ttt",
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          }
+        ],
+        "num_agents": 2,
+        "size": 3,
+        "abrupt": false,
+        "sense": 0,
+        "first": 0,
+        "maxPlies": 18,
+        "turnDelayMs": 250,
+        "player_connect_timeout_seconds": 180
+      }
+    },
+    {
+      "id": "dark-hex-4",
+      "name": "Dark Hex - 4x4",
+      "description": "OpenSpiel dark_hex, classical rules, on a 4x4 rhombus. Red links left to right, blue links bottom to top, and a collision does not end your turn: you move again, one cell wiser.",
+      "game_config": {
+        "mode": "dark-hex",
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          }
+        ],
+        "num_agents": 2,
+        "size": 4,
+        "abrupt": false,
+        "sense": 0,
+        "first": 0,
+        "maxPlies": 32,
+        "turnDelayMs": 250,
+        "player_connect_timeout_seconds": 180
+      }
+    },
+    {
+      "id": "dark-hex-5",
+      "name": "Abrupt Dark Hex - 5x5",
+      "description": "OpenSpiel abrupt_dark_hex on a 5x5 rhombus: a collision ENDS your turn, so every fact you buy costs you a stone. The certification fixture and the flagship variant.",
+      "game_config": {
+        "mode": "dark-hex",
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          }
+        ],
+        "num_agents": 2,
+        "size": 5,
+        "abrupt": true,
+        "sense": 0,
+        "first": 0,
+        "maxPlies": 50,
+        "turnDelayMs": 250,
+        "player_connect_timeout_seconds": 180
+      }
+    },
+    {
+      "id": "recon-hex-5",
+      "name": "Reconnaissance Dark Hex - 5x5",
+      "description": "An ORIGINAL variant, not an OpenSpiel port: Abrupt Dark Hex 5x5 with Reconnaissance Blind Chess's sense-then-move loop transplanted onto it. Each ply the mover first names a 2x2 window and is told the truth about those four cells, then moves - and it is the one variant where knowing a cell is EMPTY goes stale.",
+      "game_config": {
+        "mode": "dark-hex",
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          }
+        ],
+        "num_agents": 2,
+        "size": 5,
+        "abrupt": true,
+        "sense": 2,
+        "first": 0,
+        "maxPlies": 50,
+        "turnDelayMs": 250,
+        "player_connect_timeout_seconds": 180
+      }
+    }
+  ],
+  "certification": {
+    "game_config": {
+      "mode": "dark-hex",
+      "players": [
+        {
+          "name": "Sprocket"
+        },
+        {
+          "name": "Gizmo"
+        }
+      ],
+      "num_agents": 2,
+      "size": 5,
+      "abrupt": true,
+      "sense": 0,
+      "first": 0,
+      "maxPlies": 50,
+      "seed": 23,
+      "turnDelayMs": 0,
+      "player_connect_timeout_seconds": 180
+    },
+    "players": [
+      {
+        "player_id": "fog-of-war-boards-player"
+      },
+      {
+        "player_id": "fog-of-war-boards-scripted"
+      }
+    ]
+  }
+}

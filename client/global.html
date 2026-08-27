@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Fog-of-War Boards — Table View</title>
+<link rel="stylesheet" href="/client/chrome.css">
+</head>
+<body>
+<div id="layout">
+  <div id="stage">
+    <div id="topband">
+      <div id="wordmark">FOG<span>BOARDS</span></div>
+      <div id="clock">PLY 0</div>
+      <div id="topright">
+        <span id="statuschip">connecting…</span>
+        <button id="feedtoggle">LOG »</button>
+      </div>
+    </div>
+    <div id="scorebug"></div>
+    <div id="board-wrap">
+      <canvas id="table" width="960" height="640"></canvas>
+      <div id="lightpool"></div>
+      <div id="grain"></div>
+      <div id="endscreen"></div>
+    </div>
+    </div>
+  <div id="feed"></div>
+</div>
+<script src="/client/chrome_common.js"></script>
+<script src="/client/renderer.js"></script>
+<script>
+  var canvas = document.getElementById("table");
+  function fit() {
+    canvas.width = canvas.clientWidth;
+    canvas.height = canvas.clientHeight;
+  }
+  window.addEventListener("resize", fit);
+  window.addEventListener("load", fit);
+  fit();
+  FogRenderer.bindFeedToggle(document.getElementById("feedtoggle"));
+  FogRenderer.attachLive({
+    canvas: canvas,
+    feed: document.getElementById("feed"),
+    status: document.getElementById("statuschip"),
+    clock: document.getElementById("clock"),
+    scorebug: document.getElementById("scorebug"),
+    endscreen: document.getElementById("endscreen"),
+    assetBase: "/client/assets",
+    wsPath: "/global"
+  });
+</script>
+<!-- ============================================================
+     fog-of-war-boards additions to the inherited cogame-babel chrome.
+     Everything above this line is cogame-babel's page, copied byte for
+     byte and renamed; no starter element is removed. The truth board and
+     both belief boards are three viewports inside the existing
+     canvas#table, so nothing is spliced into #board-wrap.
+     ============================================================ -->
+<script>
+  FogChrome.relayout();
+  window.addEventListener("resize", FogChrome.relayout);
+</script>
+</body>
+</html>

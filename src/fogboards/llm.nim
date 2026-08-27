@@ -287,10 +287,15 @@ proc sweepCell*(sim: Sim, seat: int): int =
         return cell
     return legal[0]
   let n = sim.config.size
-  ## Every collision this seat caused shifted the corridor one step.
+  ## Every collision this seat caused shifted the corridor one step, and a
+  ## shift does NOT restart the walk: it continues from the same offset
+  ## (design.md:345-349). The offset advances only when the seat actually
+  ## takes a corridor cell, so it is exactly the number of stones it has
+  ## laid; when the corridor runs out, take the lowest-index legal cell.
   let shift = sim.probes[seat]
   let lane = (n div 2 + shift) mod n
-  for offset in 0 ..< n:
+  let start = sim.stones[seat]
+  for offset in start ..< n:
     let cell =
       if seat == 0: lane * n + offset
       else: offset * n + lane

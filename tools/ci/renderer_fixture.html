@@ -57,6 +57,12 @@
   "use strict";
 
   var WIDTHS = [360, 640, 1280];
+  // The cap the server enforces on `say` (llm.nim MaxSayLen) and the cap
+  // the scorebug slices to (renderer.js MAX_SAY_LEN). The fixture builds
+  // its remarks at exactly this length and asserts the band still carries
+  // exactly this many runes, so a remark quietly shortened at either end
+  // fails here instead of leaving the fixture green while testing nothing.
+  var SAY_RUNES = 80;
   var SIZE = 5;
   var CELLS = SIZE * SIZE;
   var report = document.getElementById("report");
@@ -84,8 +90,8 @@
       "his chain has to cross d3 and i will sit on it until he pays for it \u2014 " :
       "they are bridging low so i take c2 now and let them waste a ply on b4 \u2014 ";
     var runes = Array.from(base);
-    while (runes.length < 80) runes.push("\u2026");
-    return runes.slice(0, 80).join("");
+    while (runes.length < SAY_RUNES) runes.push("\u2026");
+    return runes.slice(0, SAY_RUNES).join("");
   }
 
   var POLICY_NAMES = ["fog-of-war-boards-cartographer",
@@ -321,10 +327,14 @@
           "px, found " + says.length);
       }
       says.forEach(function (node) {
-        var text = (node.innerText || "").trim();
-        if (Array.from(text).length < 20) {
-          problems.push("the say band at " + width +
-            "px carried only " + Array.from(text).length + " runes");
+        // The whole cap, not a floor: a floor would leave this fixture
+        // green against a renderer that sliced the remark to a third of
+        // the band, or against a fixture whose own remark had been
+        // shortened -- exactly what this gate exists to catch.
+        var runes = Array.from(node.textContent || "").length;
+        if (runes !== SAY_RUNES) {
+          problems.push("the say band at " + width + "px carried " + runes +
+            " runes, not the full " + SAY_RUNES);
         }
       });
       var quoted = 0;

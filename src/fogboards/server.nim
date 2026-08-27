@@ -488,7 +488,15 @@ proc websocketHandler(
               let text = node.getStr().strip()
               if text.len > 0 and text.toLowerAscii() notin ["0", "false", "no"]:
                 scripted = true
-                baseline = parseBaseline(text)
+                ## An unknown baseline name must not take the PROMPT down
+                ## with it: parseBaseline raises, and the handler's outer
+                ## `except` would drop the whole frame, leaving the slot
+                ## with neither a baseline nor the prompt it delivered.
+                try:
+                  baseline = parseBaseline(text)
+                except CatchableError:
+                  echo "fogboards: slot ", slot, " asked for an unknown ",
+                    "baseline (", cleanText(text, 40), "); using probe"
             else:
               discard
           withLock stateLock:

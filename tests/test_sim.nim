@@ -362,6 +362,32 @@ suite "reconnaissance":
             check event.anchor.len >= 2
         check senses == recon.plies
 
+  test "11b. a fill by the opponent leaves the other seat's record alone":
+    ## The ONLY channel through which a seat learns anything about the
+    ## opponent is the referee's answer to the seat's own action. A
+    ## placement by seat 1 must therefore not touch seat 0's sensed-empty
+    ## list: a seat that diffed that list across plies would read the
+    ## opponent's move out of it, and the belief board's fading dot would
+    ## vanish on the fill instead of going stale.
+    var sim = initSim(fixture(mDarkHex, 5, sense = 2))
+    discard sim.beginPly()
+    sim.applySense(0, sim.cellIndex("b3"))       ## b3 c3 b4 c4, all empty
+    check sim.cellIndex("b4") in sim.sensedEmptyAt[0]
+    sim.applyAttempt(0, sim.cellIndex("a1"), "", "", @[], true, false)
+    check sim.beginPly() == 1
+    sim.applySense(1, sim.cellIndex("b3"))       ## seat 1 sees it too
+    check sim.cellIndex("b4") in sim.sensedEmptyAt[1]
+    sim.applyAttempt(1, sim.cellIndex("b4"), "", "", @[], true, false)
+    ## Seat 1 filled b4 itself, so its own record goes. Seat 0 was never
+    ## told, so its record -- and its timestamp -- stand.
+    check sim.cellIndex("b4") notin sim.sensedEmptyAt[1]
+    check sim.cellIndex("b4") in sim.sensedEmptyAt[0]
+    check sim.sensedEmptyAt[0][sim.cellIndex("b4")] == 0
+    ## And it is still not knowledge of occupancy: b4 stays legal for
+    ## seat 0 and stays empty on its believed board.
+    check sim.cellIndex("b4") in sim.legalAttempts(0)
+    check sim.believedBoard(0)[sim.cellIndex("b4")] == ocEmpty
+
 suite "fog":
   test "12. a seat's believed board never holds an unproven stone":
     for config in variants():

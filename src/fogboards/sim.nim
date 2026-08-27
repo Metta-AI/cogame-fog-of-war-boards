@@ -427,8 +427,14 @@ proc applyAttempt*(sim: var Sim, seat, cell: int, say, notes: string,
     sim.board[cell] = occupantOf(seat)
     inc sim.stones[seat]
     placed = true
-    for other in 0 ..< Seats:
-      sim.sensedEmptyAt[other].del(cell)
+    ## Only the MOVER's record is rewritten. The opponent was never told
+    ## this cell was filled -- the only channel through which a seat
+    ## learns anything about the other is the referee's answer to its own
+    ## action -- so deleting its timestamp too would let a seat read the
+    ## opponent's move straight out of its own sensed-empty list. It keeps
+    ## the stale entry, which is what "may be stale" means in the prompt
+    ## and what makes the belief board's dot fade rather than vanish.
+    sim.sensedEmptyAt[seat].del(cell)
 
   ## Guesses are scored, never enforced: a wrong guess costs the seat
   ## nothing but its accuracy.

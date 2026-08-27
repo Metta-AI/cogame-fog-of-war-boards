@@ -641,7 +641,9 @@ proc completeText(client: LlmClient, system, user: string): string =
     url = AnthropicUrl
   let response = client.curl.post(url, headers, $body, client.timeoutSeconds)
   if response.code == 401 or response.code == 403:
-    let detail = response.body[0 .. min(response.body.high, 400)]
+    ## Rune-safe, never a byte slice: an HTTP body cut at a byte offset can
+    ## end in half a rune, and this text goes on to stdout.
+    let detail = cleanText(response.body.replace("\n", " "), MaxErrorLen)
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
       raise newException(FogError, "bedrock model access denied: " & detail)
@@ -649,12 +651,12 @@ proc completeText(client: LlmClient, system, user: string): string =
     raise newException(FogError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
-    let detail = response.body[0 .. min(response.body.high, 300)]
+    let detail = cleanText(response.body.replace("\n", " "), MaxErrorLen)
     discard client.tryNextBedrockModel("throttled")
     raise newException(FogError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
     raise newException(FogError, "anthropic error " & $response.code &
-      ": " & response.body[0 .. min(response.body.high, 300)])
+      ": " & cleanText(response.body.replace("\n", " "), MaxErrorLen))
   let payload = parseJson(response.body)
   if payload{"stop_reason"}.getStr() == "refusal":
     raise newException(FogError, "anthropic refusal")

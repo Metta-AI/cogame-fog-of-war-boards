@@ -123,6 +123,8 @@ replay pod anywhere.
 
 ## Layout
 
+Training from complete native matches is documented in [docs/TRAINING.md](docs/TRAINING.md).
+
 - `src/fogboards.nim` — entrypoint (Coworld runtime contract, live vs replay)
 - `src/fogboards/types.nim` — config, events, enums
 - `src/fogboards/sim.nim` — pure rules: the board, the fog, `distToWin`,

@@ -17,7 +17,7 @@ manifest with source revision, seeds, plies, final scores, and row counts.
 Ten matches yielded 88/22, 64/16, 72/18, and 72/18 train/validation
 decisions respectively, in that variant order.
 
-All 440 examples fit 4,096 tokens with the local WordLevel smoke tokenizer.
+All 370 examples fit 4,096 tokens with the local WordLevel smoke tokenizer.
 One CPU optimizer step reduced four-example validation loss from 1.85891
 to 1.85353, 1.83972 to 1.83441, 1.82757 to 1.82295, and 1.78231 to
 1.77724 in the same variant order. This verifies the post-training path;

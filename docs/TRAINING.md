@@ -17,6 +17,12 @@ manifest with source revision, seeds, plies, final scores, and row counts.
 Ten matches yielded 88/22, 64/16, 72/18, and 72/18 train/validation
 decisions respectively, in that variant order.
 
+All 440 examples fit 4,096 tokens with the local WordLevel smoke tokenizer.
+One CPU optimizer step reduced four-example validation loss from 1.85891
+to 1.85353, 1.83972 to 1.83441, 1.82757 to 1.82295, and 1.78231 to
+1.77724 in the same variant order. This verifies the post-training path;
+it does not measure league play.
+
 From a Metta checkout with the post-training package installed:
 
 ```sh
@@ -44,3 +50,15 @@ From a Metta checkout with the Coworld training stack, pass absolute bridge
 and manifest paths to `recipes.external.coworld.train` for native PufferLib,
 or `recipes.external.coworld_metta_rl.train` for Metta RL. Set `players=2`
 and use any certified variant ID.
+
+Each variant completed a 512-timestep Metta RL pilot with the native
+terminal scores and the acting seat's fogged numeric observation.
+
+Native PufferLib completed 4,096 CUDA timesteps per variant on metta1.
+Reloaded checkpoints on held-out seeds 101 and 102 reported mean scores
+0/0 for phantom tic-tac-toe and 1/1 for each Dark Hex variant. Checkpoint
+SHA-256 values, in the variant order above, were
+`22c7dd28572b85f79c0cfef85e47b233e1fc79983cb2d530df289db48cfb3677`,
+`af9ebb66f78937b562f0144331f4f268d8a857956bf62d274c049f9806ef69c0`,
+`f5174d2b1c088ee0646ab82c50418908c690d7a7d279306e7f6f131c85571243`,
+and `6a84fed90122cf6376a3f03fcd6a8eda304ec6ba03b4a25f542dd9e7a3b6275f`.

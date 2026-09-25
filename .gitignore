@@ -1,6 +1,7 @@
 bin/
 tmp/
 dist/
+dist-jev/
 replay-viewer/dist/nimcache/
 *.replay
 # Host-specific nimby package paths; regenerate per machine (see README).

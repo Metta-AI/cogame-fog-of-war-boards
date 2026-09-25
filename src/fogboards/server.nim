@@ -12,7 +12,7 @@
 ##   GET /client/chrome_common.js    - the inherited broadcast chrome
 ##   GET /client/chrome.css
 ##   GET /client/assets/<name>       - sprites and fonts
-##   WS  /player?slot=N&token=T      - fogboards.player.v1
+##   WS  /player?slot=N&token=T      - fogboards.player.v2
 ##   WS  /global                     - spectator snapshots
 ##   WS  /replay                     - the replay payload (replay mode)
 
@@ -44,6 +44,12 @@ type
     prompts: seq[string]
     scripted: seq[bool]
     baselines: seq[Baseline]
+    external: seq[bool]
+    registered: seq[bool]
+    decisionId: int
+    pendingSeat: int
+    pendingDecision: Decision
+    pendingAccepted: bool
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -99,8 +105,8 @@ proc snapshotJson(gs: GameState): JsonNode =
 proc playerStateJson(gs: GameState, slot: int): JsonNode =
   ## REDACTED: no board, no cell list, and nothing about the opponent
   ## beyond what this seat has proven. `distToWin` is the seat's BELIEVED
-  ## value, never the true one. Decisions are server-side, so a policy
-  ## loses nothing by this.
+  ## value, never the true one. External policies receive their legal
+  ## choices in the per-turn observation frame.
   %*{
     "type": "state",
     "slot": slot,
@@ -121,6 +127,34 @@ proc playerStateJson(gs: GameState, slot: int): JsonNode =
     "done": gs.sim.done,
     "reason": gs.sim.reason,
     "ending": gs.sim.ending
+  }
+
+proc observationJson(sim: Sim, seat: int): JsonNode =
+  var own, proven, attempts, anchors, sensed = newJArray()
+  for cell in 0 ..< sim.cells:
+    if sim.ownsCell(seat, cell):
+      own.add(%sim.cellName(cell))
+    elif cell in sim.known[seat]:
+      proven.add(%sim.cellName(cell))
+  for cell in sim.legalAttempts(seat):
+    attempts.add(%sim.cellName(cell))
+  for cell in sim.legalAnchors(seat):
+    anchors.add(%sim.cellName(cell))
+  for cell in 0 ..< sim.cells:
+    if sim.sensedEmptyAt[seat].hasKey(cell):
+      sensed.add(%*{
+        "cell": sim.cellName(cell),
+        "lastSeenPly": sim.sensedEmptyAt[seat][cell]
+      })
+  %*{
+    "game": "fog-of-war-boards", "slot": seat, "name": sim.names[seat],
+    "mode": $sim.config.mode, "size": sim.config.size,
+    "abrupt": sim.config.abrupt, "senseSize": sim.config.sense,
+    "ply": sim.plies, "maxPlies": sim.config.maxPlies,
+    "ownStones": own, "provenOpponentStones": proven,
+    "sensedEmpty": sensed, "legalAttempts": attempts,
+    "legalSenseAnchors": anchors, "believedDistToWin": sim.believedDistToWin(seat),
+    "refereeLog": sim.refereeLog(seat), "notes": sim.notes[seat]
   }
 
 proc broadcastLocked(gs: GameState) =
@@ -226,6 +260,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var allConnected = false
       withLock stateLock:
         allConnected = state.playerSockets.len >= config.tokens.len
+        for registered in state.registered:
+          allConnected = allConnected and registered
       if allConnected:
         break
       sleep(200)
@@ -266,6 +302,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var mover = -1
       var seatPrompt: string
       var seatScripted = false
+      var seatExternal = false
       var seatBaseline = blProbe
 
       ## 1. beginPly, and 2. the wall-clock guard — checked BEFORE any
@@ -285,6 +322,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           simCopy = state.sim
           seatPrompt = state.prompts[mover]
           seatScripted = state.scripted[mover]
+          seatExternal = state.external[mover]
           seatBaseline = state.baselines[mover]
       if mover < 0:
         break
@@ -293,7 +331,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       ## minute per episode; a ply issues at most two, so LLM-driven plies
       ## start no closer together than the derived floor. Scripted seats
       ## are not gated, which is what keeps offline certification fast.
-      let usesLlm = not (seatScripted or client.disabled)
+      let usesLlm = seatExternal or not (seatScripted or client.disabled)
       if usesLlm and lastLlmStart > 0.0:
         let wait = lastLlmStart + spacing - epochTime()
         if wait > 0.0:
@@ -301,10 +339,39 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       if usesLlm:
         lastLlmStart = epochTime()
 
-      ## 3-5. The slow part (Claude) runs OUTSIDE the lock on a snapshot;
+      ## 3-5. Model or external policy work runs OUTSIDE the lock on a snapshot;
       ## only this thread mutates the sim, so the snapshot cannot go stale.
-      let decision = client.decide(simCopy, mover, seatPrompt, seatBaseline,
-        scripted = seatScripted)
+      var decision: Decision
+      if seatExternal:
+        var connected = false
+        withLock stateLock:
+          inc state.decisionId
+          state.pendingSeat = mover
+          state.pendingAccepted = false
+          connected = state.playerSockets.hasKey(mover)
+          if connected:
+            state.playerSockets[mover].send($ %*{
+              "type": "observation", "id": state.decisionId,
+              "observation": observationJson(simCopy, mover)
+            })
+        let deadline = epochTime() + config.llmTimeoutSeconds.float
+        while connected and epochTime() < deadline:
+          withLock stateLock:
+            if state.pendingAccepted:
+              decision = state.pendingDecision
+              break
+            connected = state.playerSockets.hasKey(mover)
+          sleep(20)
+        var accepted = false
+        withLock stateLock:
+          accepted = state.pendingAccepted
+          state.pendingSeat = -1
+        if not accepted:
+          decision = scriptedDecision(simCopy, mover, seatBaseline)
+          decision.fellBack = true
+      else:
+        decision = client.decide(simCopy, mover, seatPrompt, seatBaseline,
+          scripted = seatScripted)
 
       withLock stateLock:
         if state.sim.done:
@@ -425,7 +492,7 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
         state.playerSockets.len, "/", state.config.tokens.len, ")"
       websocket.send($ %*{
         "type": "welcome",
-        "protocol": "fogboards.player.v1",
+        "protocol": "fogboards.player.v2",
         "slot": slot,
         "name": state.sim.names[slot],
         "seats": Seats,
@@ -503,9 +570,24 @@ proc websocketHandler(
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted
             state.baselines[slot] = baseline
+            state.external[slot] = false
+            state.registered[slot] = true
           echo "fogboards: slot ", slot, " delivered a prompt (",
             prompt.len, " chars",
             (if scripted: ", scripted " & $baseline else: ""), ")"
+        elif payload{"type"}.getStr() == "register" and
+            payload["control"].getStr() == "external":
+          withLock stateLock:
+            state.external[slot] = true
+            state.registered[slot] = true
+          echo "fogboards: slot ", slot, " registered external control"
+        elif payload{"type"}.getStr() == "action":
+          let id = payload["id"].getInt()
+          withLock stateLock:
+            if state.external[slot] and state.pendingSeat == slot and
+                state.decisionId == id and not state.pendingAccepted:
+              state.pendingDecision = state.sim.parseReply(slot, payload)
+              state.pendingAccepted = true
       except CatchableError as error:
         echo "fogboards: ignoring bad player frame: ", error.msg
     of ErrorEvent:
@@ -584,6 +666,9 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.prompts = newSeq[string](config.players.len)
   state.scripted = newSeq[bool](config.players.len)
   state.baselines = newSeq[Baseline](config.players.len)
+  state.external = newSeq[bool](config.players.len)
+  state.registered = newSeq[bool](config.players.len)
+  state.pendingSeat = -1
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)

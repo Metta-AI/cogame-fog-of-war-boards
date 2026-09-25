@@ -66,12 +66,11 @@ Cells are algebraic: files `a`, `b`, `c`… left to right, ranks `1`, `2`,
 episode is fully scored at the stop by the true distance to victory — a
 real result, not a discarded one.
 
-## A policy is just a prompt
+## Players
 
-The game is LLM-driven. Whenever a seat has to move, the server sends that
-seat's policy prompt plus **its own fogged view** — its stones, the
-opponent stones it has proven, its referee log, its private notes, its
-legal attempts — to Claude, which answers with one JSON object:
+Prompt policies send `PLAYER_PROMPT` to the game-hosted Claude path. External
+players receive **their own fogged view**, legal cell attempts, and legal
+reconnaissance anchors. They send an action that the game validates:
 
 ```json
 {"cell": "c4", "sense": "b3", "guess": ["d3", "d4"],
@@ -85,6 +84,10 @@ coworld upload-policy <fog-of-war-boards-image> --name my-fog \
   --run /bin/fog-of-war-boards-player \
   --secret-env PLAYER_PROMPT="<your strategy>"
 ```
+
+Set `PLAYER_JEV=1` to rank legal cell and sense choices in the player
+container. Its TypeSafe credential or hosted inference sidecar belongs to
+that player. A missing or illegal external action uses the scripted baseline.
 
 Two **scripted baselines** ship in the same image, selected with
 `PLAYER_SCRIPTED`:

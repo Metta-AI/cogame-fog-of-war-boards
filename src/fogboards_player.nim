@@ -1,10 +1,8 @@
-## Fog-of-War Boards player: a policy is just a prompt.
+## Fog-of-War Boards prompt, scripted, or external Jev player.
 ##
-## Connects to the game, delivers its prompt (from PLAYER_PROMPT, or a
-## default fog strategy), then idles until the final frame. All of the
-## actual decision making happens inside the game server, which sends this
-## seat's prompt plus its own view of the board to Claude on every ply it
-## has to move.
+## Prompt policies deliver PLAYER_PROMPT and idle until the final frame.
+## PLAYER_JEV=1 registers external control, receives a seat-local observation
+## and returns a cell attempt (and a sense anchor in reconnaissance variants).
 ##
 ## PLAYER_SCRIPTED=probe|sweep registers the seat as one of the two
 ## built-in baselines instead: the server plays it deterministically, no
@@ -17,7 +15,8 @@
 
 import
   std/[json, options, os, strutils],
-  whisky
+  whisky,
+  fogboards/jev_policy
 
 const DefaultPrompt = "You can only see your own stones. Every ply, write " &
   "down what you have proven about the opponent and what you merely " &
@@ -29,6 +28,7 @@ when isMainModule:
   let url = getEnv("COWORLD_PLAYER_WS_URL")
   if url.len == 0:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
+  let jev = getEnv("PLAYER_JEV") == "1"
   var prompt = getEnv("PLAYER_PROMPT")
   if prompt.len == 0:
     prompt = DefaultPrompt
@@ -52,9 +52,13 @@ when isMainModule:
 
   echo "fogboards player: connecting to game"
   let socket = newWebSocket(url)
-  socket.send(promptFrame())
-  echo "fogboards player: prompt delivered (", prompt.len, " chars",
-    (if scripted.len > 0: ", scripted " & scripted else: ""), ")"
+  if jev:
+    socket.send($ %*{"type": "register", "control": "external"})
+    echo "fogboards player: external Jev control registered"
+  else:
+    socket.send(promptFrame())
+    echo "fogboards player: prompt delivered (", prompt.len, " chars",
+      (if scripted.len > 0: ", scripted " & scripted else: ""), ")"
 
   ## whisky RAISES on a close frame or a truncated read (only a timeout
   ## returns none), and the game's quit(0) can outrun the flushed final
@@ -78,7 +82,16 @@ when isMainModule:
             payload{"slot"}.getInt(), " as ", payload{"name"}.getStr()
           ## Re-deliver the prompt after the welcome, in case the first
           ## send raced the server's slot registration.
-          socket.send(promptFrame())
+          if jev:
+            socket.send($ %*{"type": "register", "control": "external"})
+          else:
+            socket.send(promptFrame())
+        of "observation":
+          if jev:
+            var action = chooseAction(payload["observation"],
+              getEnv("PLAYER_PROMPT"))
+            action["id"] = payload["id"]
+            socket.send($action)
         of "final":
           echo "fogboards player: final scores ", payload{"scores"}
           break

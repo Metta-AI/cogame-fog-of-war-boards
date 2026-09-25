@@ -1,0 +1,7 @@
+services:
+  fog-of-war-boards:
+    image: fogboards-jev-25001:local
+    platform: linux/amd64
+    build:
+      context: .
+      network: host

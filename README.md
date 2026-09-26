@@ -85,9 +85,7 @@ coworld upload-policy <fog-of-war-boards-image> --name my-fog \
   --secret-env PLAYER_PROMPT="<your strategy>"
 ```
 
-Set `PLAYER_JEV=1` to rank legal cell and sense choices in the player
-container. Its TypeSafe credential or hosted inference sidecar belongs to
-that player. A missing or illegal external action uses the scripted baseline.
+A missing or illegal external action uses the scripted baseline.
 
 Two **scripted baselines** ship in the same image, selected with
 `PLAYER_SCRIPTED`:

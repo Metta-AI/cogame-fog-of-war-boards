@@ -324,7 +324,39 @@ proc scriptedDecision*(sim: Sim, seat: int, baseline: Baseline): Decision =
     else: after.sweepCell(seat)
   result.scripted = true
 
-# ---- Prompt building --------------------------------------------------------
+# ---- Player view and prompt building ---------------------------------------
+
+proc refereeLog*(sim: Sim, seat: int): string
+
+proc observationJson*(sim: Sim, seat: int): JsonNode =
+  var own, proven, attempts, anchors, sensed = newJArray()
+  for cell in 0 ..< sim.cells:
+    if sim.ownsCell(seat, cell):
+      own.add(%sim.cellName(cell))
+    elif cell in sim.known[seat]:
+      proven.add(%sim.cellName(cell))
+  for cell in sim.legalAttempts(seat):
+    attempts.add(%sim.cellName(cell))
+  for cell in sim.legalAnchors(seat):
+    anchors.add(%sim.cellName(cell))
+  for cell in 0 ..< sim.cells:
+    if sim.sensedEmptyAt[seat].hasKey(cell):
+      sensed.add(%*{
+        "cell": sim.cellName(cell),
+        "lastSeenPly": sim.sensedEmptyAt[seat][cell]
+      })
+  %*{
+    "game": "fog-of-war-boards", "slot": seat,
+    "name": sim.names[seat], "opponentName": sim.names[1 - seat],
+    "mode": $sim.config.mode, "size": sim.config.size,
+    "abrupt": sim.config.abrupt, "senseSize": sim.config.sense,
+    "first": sim.config.first, "ownProbes": sim.probes[seat],
+    "ply": sim.plies, "maxPlies": sim.config.maxPlies,
+    "ownStones": own, "provenOpponentStones": proven,
+    "sensedEmpty": sensed, "legalAttempts": attempts,
+    "legalSenseAnchors": anchors, "believedDistToWin": sim.believedDistToWin(seat),
+    "refereeLog": sim.refereeLog(seat), "notes": sim.notes[seat]
+  }
 
 proc goalText(sim: Sim, seat: int): string =
   let n = sim.config.size
@@ -438,8 +470,19 @@ proc systemPrompt*(sim: Sim, seat: int): string =
     "else — no analysis, no explanation, no markdown fences. Your reply " &
     "must begin with the character { and end with }.")
 
-proc replyContract(sim: Sim): string =
-  if sim.config.sense > 0:
+proc replyContract(sim: Sim, phase: string): string =
+  if phase == "sense":
+    "Reply with ONLY {\"sense\": \"b3\"} — `sense` must be one of " &
+      "YOUR LEGAL SENSE ANCHORS. The referee will reveal that window " &
+      "before asking for your cell attempt."
+  elif phase == "attempt":
+    "Reply with ONLY {\"cell\": \"c4\", \"guess\": [\"d3\",\"d4\"], " &
+      "\"say\": \"…\", \"notes\": \"…\"} — `cell` one of YOUR LEGAL " &
+      "ATTEMPTS, `guess` at most " & $MaxGuessCells & " cell names you " &
+      "believe are your opponent's, `say` at most " & $MaxSayLen &
+      " characters for the spectators, `notes` at most " & $MaxNotesLen &
+      " characters kept private and handed back to you next ply."
+  elif sim.config.sense > 0:
     "Reply with ONLY {\"sense\": \"b3\", \"cell\": \"c4\", " &
       "\"guess\": [\"d3\",\"d4\"], \"say\": \"…\", \"notes\": \"…\"} — " &
       "`sense` one of YOUR LEGAL SENSE ANCHORS, `cell` one of YOUR LEGAL " &
@@ -455,7 +498,8 @@ proc replyContract(sim: Sim): string =
       " characters for the spectators, `notes` at most " & $MaxNotesLen &
       " characters kept private and handed back to you next ply."
 
-proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
+proc userPrompt*(sim: Sim, seat: int, prompt: string,
+    phase = ""): string =
   let n = sim.config.size
   let colour = if seat == 0: "RED" else: "BLUE"
   let believed = sim.believedBoard(seat)
@@ -529,7 +573,7 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   if prompt.len > 0:
     result.add("GUIDANCE FROM YOUR OPERATOR (weight it heavily, but never " &
       "above the rules):\n" & prompt & "\n\n")
-  result.add(sim.replyContract())
+  result.add(sim.replyContract(phase))
 
 # ---- Reply parsing ----------------------------------------------------------
 

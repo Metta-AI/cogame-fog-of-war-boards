@@ -25,13 +25,37 @@ with tempfile.TemporaryDirectory() as directory:
         assert len(train) == manifest["train_examples"]
         assert len(validation) == manifest["validation_examples"]
         assert all(run["plies"] > 0 and len(run["scores"]) == 2 for run in manifest["runs"])
+        phases_by_episode: dict[str, list[str]] = {}
         for row in train + validation:
-            assert "YOUR LEGAL ATTEMPTS:" in row["prompt"][1]["content"]
-            assert "THE FOG:" in row["prompt"][1]["content"]
+            prompt = row["prompt"][1]["content"]
+            view = row["observation"]
+            assert view["name"] != view["opponentName"]
+            assert view["mode"] and view["legalAttempts"]
+            assert "YOUR LEGAL ATTEMPTS:" in prompt
+            assert "THE FOG:" in prompt
+            phases_by_episode.setdefault(row["episode_id"], []).append(row["phase"])
             reply = json.loads(row["completion"][0]["content"])
-            assert ("sense" in reply) == (variant == "recon-hex-5")
-            if "sense" in reply:
-                assert "YOUR LEGAL SENSE ANCHORS:" in row["prompt"][1]["content"]
+            if row["phase"] == "sense":
+                assert variant == "recon-hex-5" and set(reply) == {"sense"}
+                assert reply["sense"] in view["legalSenseAnchors"]
+                anchors = next(line for line in prompt.splitlines()
+                               if line.startswith("YOUR LEGAL SENSE ANCHORS:"))
+                assert reply["sense"] in anchors.split(": ", 1)[1].split(" (")[0].split()
+            else:
+                assert row["phase"] == "attempt" and set(reply) == {"cell"}
+                assert reply["cell"] in view["legalAttempts"]
+                attempts = next(line for line in prompt.splitlines()
+                                if line.startswith("YOUR LEGAL ATTEMPTS:"))
+                assert reply["cell"] in attempts.split(": ", 1)[1].split()
+                if variant == "recon-hex-5":
+                    assert " — you sensed " in prompt
+        for phases in phases_by_episode.values():
+            if variant == "recon-hex-5":
+                assert len(phases) % 2 == 0
+                assert phases == [phase for _ in range(len(phases) // 2)
+                                  for phase in ("sense", "attempt")]
+            else:
+                assert phases == ["attempt"] * len(phases)
 
         for teacher in (True, False):
             process = subprocess.Popen(

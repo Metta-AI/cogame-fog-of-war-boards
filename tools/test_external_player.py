@@ -31,6 +31,7 @@ async def play(slot: int, port: int, recon: bool, phases: dict[int, list[str]]) 
             elif packet["type"] == "observation":
                 view = packet["observation"]
                 assert view["first"] == 0 and isinstance(view["ownProbes"], int)
+                assert view["opponentName"] != view["name"]
                 phase = packet["phase"]
                 phases[slot].append(phase)
                 if phase == "sense":

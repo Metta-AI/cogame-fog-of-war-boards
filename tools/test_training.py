@@ -28,17 +28,22 @@ with tempfile.TemporaryDirectory() as directory:
         phases_by_episode: dict[str, list[str]] = {}
         for row in train + validation:
             prompt = row["prompt"][1]["content"]
+            view = row["observation"]
+            assert view["name"] != view["opponentName"]
+            assert view["mode"] and view["legalAttempts"]
             assert "YOUR LEGAL ATTEMPTS:" in prompt
             assert "THE FOG:" in prompt
             phases_by_episode.setdefault(row["episode_id"], []).append(row["phase"])
             reply = json.loads(row["completion"][0]["content"])
             if row["phase"] == "sense":
                 assert variant == "recon-hex-5" and set(reply) == {"sense"}
+                assert reply["sense"] in view["legalSenseAnchors"]
                 anchors = next(line for line in prompt.splitlines()
                                if line.startswith("YOUR LEGAL SENSE ANCHORS:"))
                 assert reply["sense"] in anchors.split(": ", 1)[1].split(" (")[0].split()
             else:
                 assert row["phase"] == "attempt" and set(reply) == {"cell"}
+                assert reply["cell"] in view["legalAttempts"]
                 attempts = next(line for line in prompt.splitlines()
                                 if line.startswith("YOUR LEGAL ATTEMPTS:"))
                 assert reply["cell"] in attempts.split(": ", 1)[1].split()

@@ -45,6 +45,7 @@ when isMainModule:
           "seed": "fogboards-" & variant & "-" & $seed,
           "decision_id": game.plies * 2,
           "phase": "sense",
+          "observation": observationJson(game, seat),
           "prompt": [
             {"role": "system", "content": systemPrompt(game, seat)},
             {"role": "user", "content": userPrompt(game, seat, "", "sense")}
@@ -66,6 +67,7 @@ when isMainModule:
         "seed": "fogboards-" & variant & "-" & $seed,
         "decision_id": (if config.sense > 0: game.plies * 2 + 1 else: game.plies),
         "phase": "attempt",
+        "observation": observationJson(game, seat),
         "prompt": [
           {"role": "system", "content": systemPrompt(game, seat)},
           {"role": "user", "content": userPrompt(game, seat, "", "attempt")}

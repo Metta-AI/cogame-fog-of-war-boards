@@ -324,7 +324,39 @@ proc scriptedDecision*(sim: Sim, seat: int, baseline: Baseline): Decision =
     else: after.sweepCell(seat)
   result.scripted = true
 
-# ---- Prompt building --------------------------------------------------------
+# ---- Player view and prompt building ---------------------------------------
+
+proc refereeLog*(sim: Sim, seat: int): string
+
+proc observationJson*(sim: Sim, seat: int): JsonNode =
+  var own, proven, attempts, anchors, sensed = newJArray()
+  for cell in 0 ..< sim.cells:
+    if sim.ownsCell(seat, cell):
+      own.add(%sim.cellName(cell))
+    elif cell in sim.known[seat]:
+      proven.add(%sim.cellName(cell))
+  for cell in sim.legalAttempts(seat):
+    attempts.add(%sim.cellName(cell))
+  for cell in sim.legalAnchors(seat):
+    anchors.add(%sim.cellName(cell))
+  for cell in 0 ..< sim.cells:
+    if sim.sensedEmptyAt[seat].hasKey(cell):
+      sensed.add(%*{
+        "cell": sim.cellName(cell),
+        "lastSeenPly": sim.sensedEmptyAt[seat][cell]
+      })
+  %*{
+    "game": "fog-of-war-boards", "slot": seat,
+    "name": sim.names[seat], "opponentName": sim.names[1 - seat],
+    "mode": $sim.config.mode, "size": sim.config.size,
+    "abrupt": sim.config.abrupt, "senseSize": sim.config.sense,
+    "first": sim.config.first, "ownProbes": sim.probes[seat],
+    "ply": sim.plies, "maxPlies": sim.config.maxPlies,
+    "ownStones": own, "provenOpponentStones": proven,
+    "sensedEmpty": sensed, "legalAttempts": attempts,
+    "legalSenseAnchors": anchors, "believedDistToWin": sim.believedDistToWin(seat),
+    "refereeLog": sim.refereeLog(seat), "notes": sim.notes[seat]
+  }
 
 proc goalText(sim: Sim, seat: int): string =
   let n = sim.config.size

@@ -38,6 +38,11 @@ const
   ShutdownGraceMs = 20_000
 
 type
+  ExternalPhase = enum
+    epNone = "none"
+    epSense = "sense"
+    epAttempt = "attempt"
+
   GameState = object
     config: GameConfig
     sim: Sim
@@ -48,6 +53,8 @@ type
     registered: seq[bool]
     decisionId: int
     pendingSeat: int
+    pendingPhase: ExternalPhase
+    pendingSense: int
     pendingDecision: Decision
     pendingAccepted: bool
     playerSockets: Table[int, WebSocket]
@@ -150,6 +157,7 @@ proc observationJson(sim: Sim, seat: int): JsonNode =
     "game": "fog-of-war-boards", "slot": seat, "name": sim.names[seat],
     "mode": $sim.config.mode, "size": sim.config.size,
     "abrupt": sim.config.abrupt, "senseSize": sim.config.sense,
+    "first": sim.config.first, "ownProbes": sim.probes[seat],
     "ply": sim.plies, "maxPlies": sim.config.maxPlies,
     "ownStones": own, "provenOpponentStones": proven,
     "sensedEmpty": sensed, "legalAttempts": attempts,
@@ -250,6 +258,36 @@ proc plySpacing(config: GameConfig): float =
 proc worstPlySeconds(config: GameConfig): float =
   (2 * config.llmTimeoutSeconds + PlyGuardSlackSeconds).float
 
+proc awaitExternalPhase(sim: Sim, mover: int, phase: ExternalPhase,
+    timeoutSeconds: int): bool {.gcsafe.} =
+  {.gcsafe.}:
+    var connected = false
+    withLock stateLock:
+      inc state.decisionId
+      state.pendingSeat = mover
+      state.pendingPhase = phase
+      state.pendingAccepted = false
+      if phase == epSense:
+        state.pendingSense = -1
+      connected = state.playerSockets.hasKey(mover)
+      if connected:
+        state.playerSockets[mover].send($ %*{
+          "type": "observation", "id": state.decisionId,
+          "phase": $phase, "observation": observationJson(sim, mover)
+        })
+    let deadline = epochTime() + timeoutSeconds.float
+    while connected and epochTime() < deadline:
+      withLock stateLock:
+        if state.pendingAccepted:
+          result = true
+          break
+        connected = state.playerSockets.hasKey(mover)
+      sleep(20)
+    withLock stateLock:
+      result = state.pendingAccepted
+      state.pendingSeat = -1
+      state.pendingPhase = epNone
+
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
     let config = state.config
@@ -343,30 +381,25 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       ## only this thread mutates the sim, so the snapshot cannot go stale.
       var decision: Decision
       if seatExternal:
-        var connected = false
-        withLock stateLock:
-          inc state.decisionId
-          state.pendingSeat = mover
-          state.pendingAccepted = false
-          connected = state.playerSockets.hasKey(mover)
-          if connected:
-            state.playerSockets[mover].send($ %*{
-              "type": "observation", "id": state.decisionId,
-              "observation": observationJson(simCopy, mover)
-            })
-        let deadline = epochTime() + config.llmTimeoutSeconds.float
-        while connected and epochTime() < deadline:
+        var accepted = true
+        if config.sense > 0:
+          accepted = awaitExternalPhase(simCopy, mover, epSense,
+            config.llmTimeoutSeconds)
+          if accepted:
+            var afterSense = simCopy
+            var anchor: int
+            withLock stateLock:
+              anchor = state.pendingSense
+            afterSense.applySense(mover, anchor)
+            accepted = awaitExternalPhase(afterSense, mover, epAttempt,
+              config.llmTimeoutSeconds)
+        else:
+          accepted = awaitExternalPhase(simCopy, mover, epAttempt,
+            config.llmTimeoutSeconds)
+        if accepted:
           withLock stateLock:
-            if state.pendingAccepted:
-              decision = state.pendingDecision
-              break
-            connected = state.playerSockets.hasKey(mover)
-          sleep(20)
-        var accepted = false
-        withLock stateLock:
-          accepted = state.pendingAccepted
-          state.pendingSeat = -1
-        if not accepted:
+            decision = state.pendingDecision
+        else:
           decision = scriptedDecision(simCopy, mover, seatBaseline)
           decision.fellBack = true
       else:
@@ -492,7 +525,7 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
         state.playerSockets.len, "/", state.config.tokens.len, ")"
       websocket.send($ %*{
         "type": "welcome",
-        "protocol": "fogboards.player.v2",
+        "protocol": "fogboards.player.v3",
         "slot": slot,
         "name": state.sim.names[slot],
         "seats": Seats,
@@ -586,7 +619,24 @@ proc websocketHandler(
           withLock stateLock:
             if state.external[slot] and state.pendingSeat == slot and
                 state.decisionId == id and not state.pendingAccepted:
-              state.pendingDecision = state.sim.parseReply(slot, payload)
+              case state.pendingPhase
+              of epSense:
+                let anchor = state.sim.parseCellNode(payload{"sense"})
+                if anchor notin state.sim.legalAnchors(slot):
+                  raise newException(FogError, "not a legal sense anchor")
+                state.pendingSense = anchor
+              of epAttempt:
+                var afterSense = state.sim
+                var reply = copy(payload)
+                if state.config.sense > 0:
+                  afterSense.applySense(slot, state.pendingSense)
+                  reply["sense"] = %state.sim.cellName(state.pendingSense)
+                let proposed = afterSense.parseReply(slot, reply)
+                if proposed.cell notin afterSense.legalAttempts(slot):
+                  raise newException(FogError, "not a legal cell attempt")
+                state.pendingDecision = proposed
+              of epNone:
+                raise newException(FogError, "no external decision pending")
               state.pendingAccepted = true
       except CatchableError as error:
         echo "fogboards: ignoring bad player frame: ", error.msg

@@ -38,26 +38,42 @@ when isMainModule:
       let seat = game.beginPly()
       let baseline = if seat == 0: blProbe else: blSweep
       let decision = scriptedDecision(game, seat, baseline)
-      var reply = %*{"cell": game.cellName(decision.cell)}
       if config.sense > 0:
-        reply["sense"] = %game.cellName(decision.anchor)
-      let accepted = parseReply(game, seat, reply)
+        let sense = %*{"sense": game.cellName(decision.anchor)}
+        rows.add($(%*{
+          "episode_id": "fogboards-" & variant & "-" & $seed,
+          "seed": "fogboards-" & variant & "-" & $seed,
+          "decision_id": game.plies * 2,
+          "phase": "sense",
+          "prompt": [
+            {"role": "system", "content": systemPrompt(game, seat)},
+            {"role": "user", "content": userPrompt(game, seat, "", "sense")}
+          ],
+          "completion": [{"role": "assistant", "content": $sense}],
+          "game": "fog-of-war-boards",
+          "action_schema_revision": "fogboards-player-v3"
+        }))
+        game.applySense(seat, decision.anchor)
+      let reply = %*{"cell": game.cellName(decision.cell)}
+      var fullReply = copy(reply)
+      if config.sense > 0:
+        fullReply["sense"] = %game.cellName(decision.anchor)
+      let accepted = parseReply(game, seat, fullReply)
       doAssert accepted.cell == decision.cell
       doAssert accepted.anchor == decision.anchor
       rows.add($(%*{
         "episode_id": "fogboards-" & variant & "-" & $seed,
         "seed": "fogboards-" & variant & "-" & $seed,
-        "decision_id": game.plies,
+        "decision_id": (if config.sense > 0: game.plies * 2 + 1 else: game.plies),
+        "phase": "attempt",
         "prompt": [
           {"role": "system", "content": systemPrompt(game, seat)},
-          {"role": "user", "content": userPrompt(game, seat, "")}
+          {"role": "user", "content": userPrompt(game, seat, "", "attempt")}
         ],
         "completion": [{"role": "assistant", "content": $reply}],
         "game": "fog-of-war-boards",
-        "action_schema_revision": "fogboards-reply-v1"
+        "action_schema_revision": "fogboards-player-v3"
       }))
-      if config.sense > 0:
-        game.applySense(seat, accepted.anchor)
       game.applyAttempt(seat, accepted.cell, accepted.say, accepted.notes,
         accepted.guess, true, false)
     doAssert game.reason == "complete"

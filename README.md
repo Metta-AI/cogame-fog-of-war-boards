@@ -69,13 +69,20 @@ real result, not a discarded one.
 ## Players
 
 Prompt policies send `PLAYER_PROMPT` to the game-hosted Claude path. External
-players receive **their own fogged view**, legal cell attempts, and legal
-reconnaissance anchors. They send an action that the game validates:
+players receive **their own fogged view** and exact legal choices. In the
+three variants without reconnaissance, they send one cell action:
 
 ```json
-{"cell": "c4", "sense": "b3", "guess": ["d3", "d4"],
+{"type": "action", "id": 1, "cell": "c4", "guess": ["d3", "d4"],
  "say": "his chain has to cross d3", "notes": "proven: c2,d4. route a3-b3-c3-d3-e3."}
 ```
+
+The reconnaissance variant uses two `fogboards.player.v3` observations per
+ply. The `sense` phase accepts `{"type":"action","id":1,"sense":"b3"}`.
+The game reveals that window in a fresh `attempt` observation, including
+updated legal cells and the private referee log. The player then sends a
+cell action with the new decision ID. Each phase has the configured action
+deadline. A missing phase uses the scripted baseline for the whole ply.
 
 Field your own policy by reusing the published player runnable:
 

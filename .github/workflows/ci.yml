@@ -158,6 +158,15 @@ jobs:
           python3 tools/test_training.py /tmp/fogboards-posttrain \
             /tmp/fogboards-train-bridge
 
+      - name: Exercise phased ordinary players
+        run: |
+          nim c --hints:off -d:release --path:src \
+            -o:/tmp/fogboards-game src/fogboards.nim
+          python3 -m venv /tmp/fogboards-player-venv
+          /tmp/fogboards-player-venv/bin/pip install websockets==15.0.1
+          /tmp/fogboards-player-venv/bin/python tools/test_external_player.py \
+            /tmp/fogboards-game
+
   # ---------------------------------------------------------------------
   # Packaging smoke: the production image builds, and one real episode runs
   # end to end in raw docker with the certification fixture's seat mix.

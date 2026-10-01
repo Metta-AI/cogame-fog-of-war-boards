@@ -130,12 +130,8 @@ suite "the upload contract":
       @["/bin/fog-of-war-boards"]
     check game["runnable"]["image"].getStr() ==
       "{{FOG_OF_WAR_BOARDS_IMAGE}}"
-    ## Without this the hosted container never receives the key and every
-    ## league episode silently plays scripted (hive, 2026-08-23). The
-    ## namespace is game.name, which is not always the slug.
-    let uri = game["runnable"]["env"]["ANTHROPIC_API_KEY_URI"].getStr()
-    check uri == "secret://coworld/" & game["name"].getStr() &
-      "/anthropic_api_key"
+    doAssert game{"runnable"}{"env"}{"ANTHROPIC_API_KEY_URI"}.isNil,
+      "hosted LLM uses the platform sidecar without provider secrets"
     check game["name"].getStr() == "fog-of-war-boards"
     ## The bundled minimum for cpu is "1"; 500m is rejected at upload
     ## (cogame-pistonball 0.1.1, 2026-08-26).

@@ -4,7 +4,7 @@
 ## blind, always terminating" is the completion path for this whole
 ## coworld, not a nicety.
 
-import std/[monotimes, os, sets, strutils, tables, times, unittest]
+import std/[json, monotimes, os, sets, strutils, tables, times, unittest]
 import fogboards/[llm, sim]
 
 proc fixture(mode = mDarkHex, size = 5, abrupt = true, sense = 0,
@@ -217,3 +217,21 @@ suite "the ladder degrades, never hangs":
     check parseBaseline("") == blProbe
     expect FogError:
       discard parseBaseline("mirror")
+
+
+suite "private phase teacher invariance":
+  test "unseen opponent cells do not affect current prompt or teacher action":
+    var config = fixture(mDarkHex, 5, sense = 2)
+    var original = initSim(config)
+    discard original.beginPly()
+    var changed = initSim(config)
+    discard changed.beginPly()
+    changed.board[changed.cellIndex("e5")] = occupantOf(1)
+    for phase in ["sense", "attempt"]:
+      if phase == "attempt":
+        original.applySense(0, 0)
+        changed.applySense(0, 0)
+      check original.userPrompt(0, "private guidance", phase) == changed.userPrompt(0, "private guidance", phase)
+      let first = original.scriptedPhase(0, blProbe, phase, 0)
+      let second = changed.scriptedPhase(0, blProbe, phase, 0)
+      check original.phaseAction(first, phase) == changed.phaseAction(second, phase)

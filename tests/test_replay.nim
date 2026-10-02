@@ -194,12 +194,13 @@ suite "the bytes":
       rec.topUp()
     let bytes = $rec.sim.replayPayloadJson(rec.sim.resultsJson())
     check bytes.validateUtf8() == -1
+    check notes notin bytes
     let parsed = parseJson(bytes)
     check parsed["events"].len == rec.sim.events.len
     for event in parsed["events"]:
       if event["kind"].getStr() == "attempt":
         check event["say"].getStr() == say
-        check event["notes"].getStr() == notes
+        check not event.hasKey("notes")
         check event["say"].getStr().runeLen == MaxSayLen
     ## And it survives the round trip the viewer makes.
     var back: seq[GameEvent]

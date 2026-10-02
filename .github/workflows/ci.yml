@@ -158,6 +158,12 @@ jobs:
           python3 tools/test_training.py /tmp/fogboards-posttrain \
             /tmp/fogboards-train-bridge
 
+      - name: Verify private native attempts and authoritative phase fallback
+        run: |
+          nim c --hints:off -d:release --path:src -o:/tmp/fogboards-game src/fogboards.nim
+          nim c --hints:off -d:release --path:src -o:/tmp/fogboards-player src/fogboards_player.nim
+          python3 tools/test_native_trajectory.py /tmp/fogboards-game /tmp/fogboards-player
+
       - name: Exercise phased ordinary players
         run: |
           nim c --hints:off -d:release --path:src \

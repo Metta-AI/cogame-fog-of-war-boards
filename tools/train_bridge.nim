@@ -9,22 +9,45 @@ var
   decisionId: int
   manifestPath: string
   variant: string
+  language: bool
+  sensePending: bool
+  senseAnchor: int
+  operatorPrompt: string
+  retryCount: int
 
 proc currentDecision(): JsonNode =
   let seat = game.beginPly()
   let system = systemPrompt(game, seat)
-  let user = userPrompt(game, seat, "")
+  let phase = if language and sensePending: "sense" else: "attempt"
+  var user = userPrompt(game, seat, operatorPrompt, phase)
+  if language and retryCount > 0: user.add(game.retryHint(seat, phase))
+  var schema = %*{"type": "object", "properties": {
+    "choice": {"type": "integer", "minimum": 0, "maximum": 1}},
+    "required": ["choice"]}
+  if language:
+    var legal = newJArray()
+    for cell in (if sensePending: game.legalAnchors(seat) else: game.legalAttempts(seat)):
+      legal.add(%game.cellName(cell))
+    if sensePending:
+      schema = %*{"type": "object", "properties": {
+        "sense": {"type": "string", "enum": legal}}, "required": ["sense"]}
+    else:
+      schema = %*{"type": "object", "properties": {
+        "cell": {"type": "string", "enum": legal},
+        "say": {"type": "string"}, "notes": {"type": "string"},
+        "guess": {"type": "array", "items": {"type": "string"}, "maxItems": MaxGuessCells}},
+        "required": ["cell"]}
   %*{"kind": "decision", "game": "fog-of-war-boards",
     "decision_id": decisionId, "seat": seat, "engine_seat": seat,
+    "inference_mode": (if language: %"text_action" else: newJNull()),
     "turn": game.plies,
-    "semantic_view": {"system": system, "user": user},
+    "semantic_view": {"system": system, "user": user,
+      "phase": phase, "observation": observationJson(game, seat)},
     "inbox": [], "messages": [
       {"role": "system", "content": system},
       {"role": "user", "content": user}],
     "speech_messages": [],
-    "action_schema": {"type": "object", "properties": {
-      "choice": {"type": "integer", "minimum": 0, "maximum": 1}},
-      "required": ["choice"]}, "typed_question": newJNull()}
+    "action_schema": schema, "typed_question": newJNull()}
 
 proc reset(command: JsonNode): JsonNode =
   doAssert command["players"].getInt() == Seats
@@ -39,6 +62,9 @@ proc reset(command: JsonNode): JsonNode =
   config.update($variantConfig)
   game = initSim(sampleEpisode(config))
   decisionId = 0
+  retryCount = 0
+  sensePending = language and game.config.sense > 0
+  senseAnchor = -1
   currentDecision()
 
 proc encode(): JsonNode =
@@ -60,29 +86,60 @@ proc encode(): JsonNode =
 
 proc step(command: JsonNode): JsonNode =
   if command["decision_id"].getInt() != decisionId:
-    return %*{"kind": "rejected", "reason": "stale decision"}
-  let action = parseJson(command["response"].getStr())
-  let choice = action["choice"].getInt()
-  doAssert choice in 0 .. 1
+    return %*{"kind": "rejected", "reason": "stale decision", "observation": currentDecision()}
+  var action: JsonNode
+  var consumedRejection = ""
   let seat = game.mover
-  let baseline = if choice == 0: blProbe else: blSweep
-  let decision = scriptedDecision(game, seat, baseline)
-  if game.config.sense > 0:
-    game.applySense(seat, decision.anchor)
-  game.applyAttempt(seat, decision.cell, decision.say, decision.notes,
-    decision.guess, true, false)
+  if language:
+    let phase = if sensePending: "sense" else: "attempt"
+    let proposal = game.phaseProposal(seat, command["response"].getStr(), phase, senseAnchor)
+    var decision: Decision
+    if proposal.accepted:
+      decision = proposal.decision
+    elif retryCount == 0:
+      retryCount = 1
+      return %*{"kind": "rejected", "reason": proposal.rejection,
+        "observation": currentDecision()}
+    else:
+      consumedRejection = proposal.rejection
+      decision = game.scriptedPhase(seat, blProbe, phase, senseAnchor)
+    retryCount = 0
+    action = game.phaseAction(decision, phase)
+    if sensePending:
+      senseAnchor = decision.anchor
+      game.applySense(seat, senseAnchor)
+      sensePending = false
+    else:
+      game.applyAttempt(seat, decision.cell, decision.say, decision.notes,
+        decision.guess, decision.scripted, consumedRejection.len > 0)
+      sensePending = game.config.sense > 0
+  else:
+    action = parseJson(command["response"].getStr())
+    let choice = action["choice"].getInt()
+    doAssert choice in 0 .. 1
+    let baseline = if choice == 0: blProbe else: blSweep
+    let decision = scriptedDecision(game, seat, baseline)
+    if game.config.sense > 0:
+      game.applySense(seat, decision.anchor)
+    game.applyAttempt(seat, decision.cell, decision.say, decision.notes,
+      decision.guess, true, false)
   inc decisionId
   let observation = if game.done:
     let scores = resultsJson(game)["scores"]
     %*{"kind": "terminal", "scores": {"0": scores[0], "1": scores[1]},
       "utilities": {"0": scores[0], "1": scores[1]}}
   else: currentDecision()
-  %*{"kind": "accepted", "action": action, "observation": observation}
+  if consumedRejection.len > 0:
+    %*{"kind": "consumed_rejection", "reason": consumedRejection,
+      "action": action, "observation": observation}
+  else: %*{"kind": "accepted", "action": action, "observation": observation}
 
 when isMainModule:
   let args = commandLineParams()
-  if args.len != 2:
-    quit("usage: fogboards-train-bridge MANIFEST VARIANT", 1)
+  if args.len notin 2 .. 4 or (args.len >= 3 and args[2] != "--language"):
+    quit("usage: fogboards-train-bridge MANIFEST VARIANT [--language [OPERATOR_PROMPT]]", 1)
+  language = args.len >= 3
+  operatorPrompt = if args.len == 4: args[3] else: ""
   manifestPath = absolutePath(args[0])
   variant = args[1]
   doAssert variant in ["phantom-ttt-3", "dark-hex-4", "dark-hex-5",
@@ -92,7 +149,14 @@ when isMainModule:
     let response = case command["kind"].getStr()
       of "reset": reset(command)
       of "encode": encode()
-      of "teacher": %*{"response": $(%*{"choice": 0})}
+      of "teacher":
+        if language:
+          let decision = scriptedPhase(game, game.mover, blProbe,
+            if sensePending: "sense" else: "attempt", senseAnchor)
+          let action = if sensePending: %*{"sense": game.cellName(decision.anchor)}
+            else: %*{"cell": game.cellName(decision.cell)}
+          %*{"response": $action}
+        else: %*{"response": $(%*{"choice": 0})}
       of "step": step(command)
       else: raise newException(ValueError, "unknown command")
     stdout.writeLine($response)

@@ -604,17 +604,29 @@ proc websocketHandler(
                 readAttemptEvidence(payload["training_attempt"])
                 else: newDecisionAttempt("fog-external-" & $id & "-" &
                   $state.externalAttempts.len, "external-fog", aoUnknown)
-              if attempt.origin == aoUnknown: attempt.response = copy(payload)
+              if attempt.origin in {aoTeacher, aoHuman}: attempt.origin = aoUnknown
+              if not payload.hasKey("training_attempt"): attempt.response = copy(payload)
               attempt.rejectionReason = some("external phase proposal not applied")
               state.externalAttempts.add(attempt)
               if state.pendingPhase == epNone:
                 raise newException(FogError, "no external decision pending")
               let phase = $state.pendingPhase
-              let proposal = state.sim.phaseProposal(slot, $payload, phase, state.pendingSense)
+              var proposal = state.sim.phaseProposal(slot, $payload, phase, state.pendingSense)
+              if attempt.origin == aoModel:
+                let sampled = state.sim.phaseProposal(slot,
+                  (if attempt.response.kind == JString: attempt.response.getStr() else: ""),
+                  phase, state.pendingSense)
+                if sampled.accepted:
+                  state.externalAttempts[^1].parsedAction = state.sim.phaseAction(sampled.decision, phase)
+                if not sampled.accepted or not proposal.accepted or
+                    state.externalAttempts[^1].parsedAction != state.sim.phaseAction(proposal.decision, phase):
+                  proposal.accepted = false
+                  proposal.rejection = "model response differs from player action"
               var chosen: Decision
               if proposal.accepted:
                 chosen = proposal.decision
-                state.externalAttempts[^1].parsedAction = state.sim.phaseAction(chosen, phase)
+                if attempt.origin != aoModel:
+                  state.externalAttempts[^1].parsedAction = state.sim.phaseAction(chosen, phase)
                 state.externalAttempts[^1].accepted = true
                 state.externalAttempts[^1].rejectionReason = none(string)
               else:

@@ -172,6 +172,8 @@ jobs:
           /tmp/fogboards-player-venv/bin/pip install websockets==15.0.1
           /tmp/fogboards-player-venv/bin/python tools/test_external_player.py \
             /tmp/fogboards-game
+          /tmp/fogboards-player-venv/bin/python tools/test_attempt_origins.py \
+            /tmp/fogboards-game
 
   # ---------------------------------------------------------------------
   # Packaging smoke: the production image builds, and one real episode runs

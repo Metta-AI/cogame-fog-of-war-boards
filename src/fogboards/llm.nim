@@ -17,8 +17,8 @@
 ## certification still completes - this fallback is load-bearing.
 
 import
-  std/[json, os, sets, strutils, tables, unicode],
-  bitworld/runtime,
+  std/[json, math, options, os, sets, strutils, tables, unicode],
+  bitworld/runtime, bitworld/decision_trajectory,
   curly,
   sim
 
@@ -65,6 +65,8 @@ type
     ltNone, ltSidecar, ltBedrock, ltAnthropic
 
   LlmClient* = ref object
+    lastAttempt*: DecisionAttempt
+    attempts*: seq[DecisionAttempt]
     curl: Curly
     transport: LlmTransport
     apiKey: string
@@ -73,6 +75,7 @@ type
     bedrockModels: seq[string]
     bedrockModel: int
     bedrockToken: string
+    temperature: float
     model: string
     maxOutputTokens: int
     timeoutSeconds: int
@@ -132,8 +135,12 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
     model: config.model,
     maxOutputTokens: config.maxOutputTokens,
+    temperature: getEnv("COWORLD_LLM_TEMPERATURE", "1").parseFloat(),
     timeoutSeconds: config.llmTimeoutSeconds
   )
+  if classify(result.temperature) in {fcNan, fcInf, fcNegInf} or
+      result.temperature < 0 or result.temperature > 1:
+    raise newException(ValueError, "COWORLD_LLM_TEMPERATURE must be finite and in 0..1")
   let sidecarEndpoint = getEnv("COWORLD_LLM_ENDPOINT").strip()
   if sidecarEndpoint.len > 0:
     result.transport = ltSidecar
@@ -491,24 +498,10 @@ proc replyContract(sim: Sim, phase: string): string =
       "believe are your opponent's, `say` at most " & $MaxSayLen &
       " characters for the spectators, `notes` at most " & $MaxNotesLen &
       " characters kept private and handed back to you next ply."
-  elif sim.config.sense > 0:
-    "Reply with ONLY {\"sense\": \"b3\", \"cell\": \"c4\", " &
-      "\"guess\": [\"d3\",\"d4\"], \"say\": \"…\", \"notes\": \"…\"} — " &
-      "`sense` one of YOUR LEGAL SENSE ANCHORS, `cell` one of YOUR LEGAL " &
-      "ATTEMPTS, `guess` at most " & $MaxGuessCells & " cell names you " &
-      "believe are your opponent's, `say` at most " & $MaxSayLen &
-      " characters for the spectators, `notes` at most " & $MaxNotesLen &
-      " characters kept private and handed back to you next ply."
-  else:
-    "Reply with ONLY {\"cell\": \"c4\", \"guess\": [\"d3\",\"d4\"], " &
-      "\"say\": \"…\", \"notes\": \"…\"} — `cell` one of YOUR LEGAL " &
-      "ATTEMPTS, `guess` at most " & $MaxGuessCells & " cell names you " &
-      "believe are your opponent's, `say` at most " & $MaxSayLen &
-      " characters for the spectators, `notes` at most " & $MaxNotesLen &
-      " characters kept private and handed back to you next ply."
+  else: raise newException(ValueError, "unknown Fog decision phase")
 
 proc userPrompt*(sim: Sim, seat: int, prompt: string,
-    phase = ""): string =
+    phase = "attempt"): string =
   let n = sim.config.size
   let colour = if seat == 0: "RED" else: "BLUE"
   let believed = sim.believedBoard(seat)
@@ -679,6 +672,7 @@ proc parseReply*(sim: Sim, seat: int, payload: JsonNode): Decision =
 proc completeText(client: LlmClient, system, user: string, slot: int): string =
   var body = %*{
     "max_tokens": client.maxOutputTokens,
+    "temperature": client.temperature,
     "system": system,
     "messages": [{"role": "user", "content": user}]
   }
@@ -705,7 +699,24 @@ proc completeText(client: LlmClient, system, user: string, slot: int): string =
     headers["x-api-key"] = client.apiKey
     headers["anthropic-version"] = AnthropicVersion
     url = AnthropicUrl
+  client.lastAttempt.prompt = %*[{"role": "system", "content": system},
+    {"role": "user", "content": user}]
+  client.lastAttempt.request = copy(body)
+  client.lastAttempt.model = some(if client.transport == ltBedrock:
+    client.bedrockModels[client.bedrockModel] else: client.model)
+  client.lastAttempt.decoder = %*{"temperature": client.temperature,
+    "max_tokens": client.maxOutputTokens}
   let response = client.curl.post(url, headers, $body, client.timeoutSeconds)
+  client.lastAttempt.rawResponse = %response.body
+  if response.headers.contains("X-Softmax-Llm-Call-Id"):
+    client.lastAttempt.platformCallId = some(response.headers["X-Softmax-Llm-Call-Id"])
+  for header in ["X-Coworld-Checkpoint-Sha256", "X-Coworld-Tokenizer-Sha256",
+      "X-Coworld-Chat-Template-Sha256"]:
+    if response.headers.contains(header):
+      case header
+      of "X-Coworld-Checkpoint-Sha256": client.lastAttempt.modelIdentity = some(response.headers[header])
+      of "X-Coworld-Tokenizer-Sha256": client.lastAttempt.tokenizerIdentity = some(response.headers[header])
+      else: client.lastAttempt.chatTemplateSha256 = some(response.headers[header])
   if response.code == 401 or response.code == 403:
     ## Rune-safe, never a byte slice: an HTTP body cut at a byte offset can
     ## end in half a rune, and this text goes on to stdout.
@@ -724,59 +735,132 @@ proc completeText(client: LlmClient, system, user: string, slot: int): string =
     raise newException(FogError, "anthropic error " & $response.code &
       ": " & cleanText(response.body.replace("\n", " "), MaxErrorLen))
   let payload = parseJson(response.body)
+  if payload.hasKey("model"):
+    client.lastAttempt.model = some(payload["model"].getStr())
+  client.lastAttempt.stopReason = some(payload["stop_reason"].getStr())
+  if payload.hasKey("sampling_evidence") and payload["sampling_evidence"].kind != JNull:
+    let sampling = payload["sampling_evidence"]
+    var promptIds, sampledIds: seq[int]
+    var probabilities: seq[float]
+    for token in sampling["prompt_token_ids"]: promptIds.add(token.getInt())
+    for token in sampling["completion_token_ids"]: sampledIds.add(token.getInt())
+    if sampling["behavior_log_probs"].kind != JNull:
+      for probability in sampling["behavior_log_probs"]: probabilities.add(probability.getFloat())
+    client.lastAttempt.promptTokenIds = some(promptIds)
+    client.lastAttempt.sampledTokenIds = some(sampledIds)
+    if sampling["behavior_log_probs"].kind != JNull:
+      client.lastAttempt.behaviorLogprobs = some(probabilities)
+    client.lastAttempt.stopReason = some(sampling["stop_reason"].getStr())
+    client.lastAttempt.decoder["sampling_evidence"] = copy(sampling)
   if payload{"stop_reason"}.getStr() == "refusal":
     raise newException(FogError, "anthropic refusal")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
+  client.lastAttempt.response = %result
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
     raise newException(FogError, "reply cut off at max_tokens before " &
       "any JSON: " & cleanText(result.replace("\n", " "), 160))
 
-proc retryHint(sim: Sim, seat: int): string =
+proc retryHint*(sim: Sim, seat: int, phase: string): string =
   ## Printing the legal set — computed by the SAME predicate the validator
   ## applies — is what halves fallbacks in formal-output games.
   result = "\n\nYour previous reply was invalid. Respond with ONLY the " &
     "requested JSON object; `cell` must be one of: " &
     sim.cellList(sim.legalAttempts(seat))
-  if sim.config.sense > 0:
-    result.add(" and `sense` must be one of: " &
-      sim.cellList(sim.legalAnchors(seat)))
+  if phase == "sense":
+    result = "\n\nYour previous reply was invalid. Respond with ONLY the requested JSON object; `sense` must be one of: " &
+      sim.cellList(sim.legalAnchors(seat))
 
-proc decide*(
-  client: LlmClient,
-  sim: Sim,
-  seat: int,
-  prompt: string,
-  baseline: Baseline,
-  scripted: bool
-): Decision =
-  ## One decision for one seat. NEVER raises: any failure lands on the
-  ## scripted baseline so the episode always advances.
+proc scriptedPhase*(sim: Sim, seat: int, baseline: Baseline,
+    phase: string, anchor = -1): Decision =
+  ## Read only this phase's current private belief. Never reveal another window.
+  result.scripted = true
+  if phase == "sense":
+    result.anchor = if baseline == blProbe: sim.probeAnchor(seat) else: sim.sweepAnchor(seat)
+    result.cell = -1
+  elif phase == "attempt":
+    result.anchor = anchor
+    result.cell = if baseline == blProbe: sim.probeCell(seat) else: sim.sweepCell(seat)
+  else: raise newException(ValueError, "unknown Fog decision phase")
+
+proc phaseAction*(sim: Sim, decision: Decision, phase: string): JsonNode =
+  if phase == "sense": %*{"sense": sim.cellName(decision.anchor)}
+  else:
+    var guesses = newJArray()
+    for cell in decision.guess: guesses.add(%sim.cellName(cell))
+    %*{"cell": sim.cellName(decision.cell), "say": decision.say,
+      "notes": decision.notes, "guess": guesses}
+
+proc parsePhaseReply*(sim: Sim, seat: int, payload: JsonNode,
+    phase: string, anchor = -1): Decision =
+  var probe = sim
+  if phase == "sense":
+    result = Decision(anchor: sim.parseCellNode(payload["sense"]), cell: -1)
+    probe.applySense(seat, result.anchor)
+  elif phase == "attempt":
+    var action = copy(payload)
+    if sim.config.sense > 0: action["sense"] = %sim.cellName(anchor)
+    result = sim.parseReply(seat, action)
+    probe.applyAttempt(seat, result.cell, result.say, result.notes,
+      result.guess, false, false)
+  else: raise newException(ValueError, "unknown Fog decision phase")
+
+type PhaseProposal* = object
+  accepted*: bool
+  decision*: Decision
+  rejection*: string
+
+proc phaseProposal*(sim: Sim, seat: int, response: string, phase: string,
+    anchor = -1): PhaseProposal =
+  ## The former engine rejection handler now owns the shared proposal boundary.
+  try:
+    result.decision = parsePhaseReply(sim, seat, extractJsonObject(response), phase, anchor)
+    result.accepted = true
+  except CatchableError as error:
+    result.rejection = error.msg
+
+proc decidePhase*(client: LlmClient, sim: Sim, seat: int, prompt: string,
+    baseline: Baseline, scripted: bool, phase: string, anchor = -1): Decision =
+  ## The server applies sense before rendering the next private attempt prompt.
+  client.attempts = @[]
   if scripted or client.disabled:
-    return scriptedDecision(sim, seat, baseline)
+    result = scriptedPhase(sim, seat, baseline, phase, anchor)
+    return
   let system = systemPrompt(sim, seat)
-  for attempt in 0 .. 1:
-    var user = userPrompt(sim, seat, prompt)
-    if attempt > 0:
-      user.add(sim.retryHint(seat))
+  for index in 0 .. 1:
+    var user = userPrompt(sim, seat, prompt, phase)
+    if index > 0: user.add(sim.retryHint(seat, phase))
+    client.lastAttempt = newDecisionAttempt("fog-" & $sim.plies & "-" &
+      $seat & "-" & phase & "-" & $index, "fog-prompt", aoModel)
     try:
-      let payload = extractJsonObject(client.completeText(system, user, seat))
-      let decision = parseReply(sim, seat, payload)
-      ## Reject illegal replies HERE, on a copy, so the retry carries the
-      ## hint and an illegal reply never touches the live sim.
-      var probe = sim
-      if sim.config.sense > 0:
-        probe.applySense(seat, decision.anchor)
-      probe.applyAttempt(seat, decision.cell, decision.say, decision.notes,
-        decision.guess, false, false)
-      return decision
+      let proposal = phaseProposal(sim, seat, client.completeText(system, user, seat), phase, anchor)
+      if proposal.accepted:
+        result = proposal.decision
+        client.lastAttempt.parsedAction = sim.phaseAction(result, phase)
+        client.lastAttempt.accepted = true
+        client.attempts.add(client.lastAttempt)
+        return
+      client.lastAttempt.rejectionReason = some(proposal.rejection)
+      client.attempts.add(client.lastAttempt)
     except CatchableError as error:
-      echo "fogboards llm: seat ", seat, " attempt ", attempt, " failed: ",
-        cleanText(error.msg.replace("\n", " "), MaxErrorLen)
-      if client.disabled:
-        break
-  echo "fogboards: seat ", seat, " falling back to the ", $baseline,
-    " baseline"
-  result = scriptedDecision(sim, seat, baseline)
+      client.lastAttempt.rejectionReason = some(error.msg)
+      client.attempts.add(client.lastAttempt)
+      echo "fogboards llm: seat ", seat, " phase ", phase, " attempt ", index, " rejected"
+      if client.disabled: break
+  result = scriptedPhase(sim, seat, baseline, phase, anchor)
   result.fellBack = true
+
+proc decide*(client: LlmClient, sim: Sim, seat: int, prompt: string,
+    baseline: Baseline, scripted: bool): Decision =
+  ## Offline callers follow the same two phases on their private simulator.
+  var after = sim
+  var anchor = -1
+  var senseFallback = false
+  if sim.config.sense > 0:
+    let sense = client.decidePhase(sim, seat, prompt, baseline, scripted, "sense")
+    anchor = sense.anchor
+    senseFallback = sense.fellBack
+    after.applySense(seat, anchor)
+  result = client.decidePhase(after, seat, prompt, baseline, scripted, "attempt", anchor)
+  result.fellBack = result.fellBack or senseFallback

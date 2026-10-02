@@ -164,3 +164,35 @@ nim r --path:src tests/test_bot.nim       # the baselines
 nim r --path:src tests/test_replay.nim    # record -> re-derive, and the bytes
 nim r --path:src tests/test_manifest.nim  # packaging invariants
 ```
+
+### Production language training phases
+
+`tools/train_bridge.nim MANIFEST VARIANT --language [OPERATOR_PROMPT]`
+uses full production cell actions rather than the numeric probe/sweep menu.
+Reconnaissance emits a sense decision first, applies the sense through the
+engine, and then exposes the resulting private view for the cell decision.
+Both phases use the production prompts, parser, legality checks, and notes
+updates. The default numeric interface remains a separate policy-menu
+experiment. This bridge does not qualify published-image or hosted learner
+serving parity.
+
+Native prompt and external players now use the same two phases for reconnaissance:
+the engine applies sense, then renders the revealed private window for the move.
+Both phases allow two proposals with the exact game-rendered retry hint. A second
+invalid proposal consumes the engine baseline action. Numeric baseline selection
+remains a separate research mode.
+
+Reconnaissance can issue four native requests per ply instead of two. The default
+request spacing increases from four to eight seconds; the timeout admission guard
+reserves four request timeouts. Controlled learner runs may set
+`COWORLD_LLM_PLY_SPACING_SECONDS=0`; `COWORLD_LLM_TEMPERATURE` must be finite in
+0..1. Sampling records copy actual native evidence and trusted identity headers.
+
+Set a private `COGAME_SAVE_TRAJECTORY_URI` together with `COWORLD_EPISODE_ID`,
+`COWORLD_GAME_VERSION` and immutable `COWORLD_SOURCE_REVISION` to capture complete
+engine trajectories. Truncated episodes remain explicit. Run
+`tools/export_posttrain.nim OUTPUT EPISODES VARIANT GAME_VERSION` for private local
+teacher episodes. Teacher phase actions read only the current private belief.
+New public replay and spectator frames exclude private notes, prompts and provider
+evidence; old stored replay readers remain intact. Corpus files stay outside the
+checkout and are excluded from Docker image contexts.

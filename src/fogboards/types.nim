@@ -27,7 +27,7 @@ type
     maxPlies*: int
     seed*: int
     episodeTimeoutSeconds*: int   ## assumed platform kill time when env is silent
-    plySpacingSeconds*: int       ## 0 => derive 4 (the Bedrock sidecar floor)
+    plySpacingSeconds*: int       ## 0 => derive 4, or 8 for reconnaissance
     turnDelayMs*: int
     playerConnectTimeoutSeconds*: float
     model*: string

@@ -17,8 +17,8 @@
 ##   WS  /replay                     - the replay payload (replay mode)
 
 import
-  std/[json, locks, os, sets, strutils, tables, times],
-  bitworld/runtime,
+  std/[json, locks, options, os, sets, strutils, tables, times],
+  bitworld/runtime, bitworld/decision_trajectory,
   curly,
   mummy,
   mummy/routers,
@@ -44,6 +44,10 @@ type
     epAttempt = "attempt"
 
   GameState = object
+    trajectory: Option[DecisionTrajectory]
+    externalAttempts: seq[DecisionAttempt]
+    externalRejections: int
+    externalFallback: bool
     config: GameConfig
     sim: Sim
     prompts: seq[string]
@@ -96,7 +100,7 @@ proc policyNamesJson(gs: GameState): JsonNode =
 proc snapshotJson(gs: GameState): JsonNode =
   var events = newJArray()
   for event in gs.sim.events:
-    events.add(event.eventToJson())
+    events.add(event.publicEventJson())
   var connected = newJArray()
   for slot in 0 ..< gs.config.tokens.len:
     connected.add(%gs.playerSockets.hasKey(slot))
@@ -180,6 +184,11 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     state.finished = true
     results = state.sim.resultsJson()
     replayData = state.replayPayload(results)
+    if state.trajectory.isSome:
+      var outcomes = newJObject()
+      for seat in 0 ..< Seats: outcomes[$seat] = results["scores"][seat]
+      state.trajectory.get().finish(if results["reason"].getStr() == "complete":
+        esCompleted else: esTruncated, results, outcomes)
 
     ## Send final frames to players BEFORE writing artifacts: the hosted
     ## worker tears player pods down as soon as results.json exists, and
@@ -204,6 +213,8 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     state.broadcastLocked()
 
   sleep(500)
+  if state.trajectory.isSome:
+    state.trajectory.get().writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
   echo "fogboards: writing results and replay"
   writeArtifact(
     runtimeConfig.resultsUri, $results, "application/json",
@@ -223,11 +234,15 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   quit(0)
 
 proc plySpacing(config: GameConfig): float =
+  if existsEnv("COWORLD_LLM_PLY_SPACING_SECONDS"):
+    result = getEnv("COWORLD_LLM_PLY_SPACING_SECONDS").parseFloat()
+    if result < 0: raise newException(ValueError, "LLM ply spacing must be nonnegative")
+    return
   if config.plySpacingSeconds > 0: config.plySpacingSeconds.float
-  else: DerivedPlySpacingSeconds.float
+  else: (DerivedPlySpacingSeconds * (if config.sense > 0: 2 else: 1)).float
 
 proc worstPlySeconds(config: GameConfig): float =
-  (2 * config.llmTimeoutSeconds + PlyGuardSlackSeconds).float
+  ((if config.sense > 0: 4 else: 2) * config.llmTimeoutSeconds + PlyGuardSlackSeconds).float
 
 proc awaitExternalPhase(sim: Sim, mover: int, phase: ExternalPhase,
     timeoutSeconds: int): bool {.gcsafe.} =
@@ -238,13 +253,18 @@ proc awaitExternalPhase(sim: Sim, mover: int, phase: ExternalPhase,
       state.pendingSeat = mover
       state.pendingPhase = phase
       state.pendingAccepted = false
+      state.externalAttempts = @[]
+      state.externalRejections = 0
+      state.externalFallback = false
       if phase == epSense:
         state.pendingSense = -1
       connected = state.playerSockets.hasKey(mover)
       if connected:
         state.playerSockets[mover].send($ %*{
           "type": "observation", "id": state.decisionId,
-          "phase": $phase, "observation": observationJson(sim, mover)
+          "phase": $phase, "observation": observationJson(sim, mover),
+          "messages": [{"role": "system", "content": systemPrompt(sim, mover)},
+            {"role": "user", "content": userPrompt(sim, mover, state.prompts[mover], $phase)}]
         })
     let deadline = epochTime() + timeoutSeconds.float
     while connected and epochTime() < deadline:
@@ -258,6 +278,18 @@ proc awaitExternalPhase(sim: Sim, mover: int, phase: ExternalPhase,
       result = state.pendingAccepted
       state.pendingSeat = -1
       state.pendingPhase = epNone
+
+proc recordPhase(gs: var GameState, before: Sim, seat: int, phase: string,
+    decision: Decision, attempts: seq[DecisionAttempt]) =
+  if gs.trajectory.isNone: return
+  let action = gs.sim.phaseAction(decision, phase)
+  var selected = none(string)
+  if not decision.scripted and not decision.fellBack and attempts.len > 0:
+    selected = some(attempts[^1].attemptId)
+  gs.trajectory.get().recordDecision("fog-" & $before.plies & "-" & $seat &
+    "-" & phase, $seat, observationJson(before, seat), attempts, selected, action,
+    if selected.isSome: asAccepted else: asFallback, terminal = gs.sim.done,
+    fallbackOrigin = if selected.isNone: some("game-" & $gs.baselines[seat]) else: none(string))
 
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
@@ -348,76 +380,54 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       if usesLlm:
         lastLlmStart = epochTime()
 
-      ## 3-5. Model or external policy work runs OUTSIDE the lock on a snapshot;
-      ## only this thread mutates the sim, so the snapshot cannot go stale.
-      var decision: Decision
-      if seatExternal:
-        var accepted = true
-        if config.sense > 0:
-          accepted = awaitExternalPhase(simCopy, mover, epSense,
-            config.llmTimeoutSeconds)
-          if accepted:
-            var afterSense = simCopy
-            var anchor: int
-            withLock stateLock:
-              anchor = state.pendingSense
-            afterSense.applySense(mover, anchor)
-            accepted = awaitExternalPhase(afterSense, mover, epAttempt,
-              config.llmTimeoutSeconds)
-        else:
-          accepted = awaitExternalPhase(simCopy, mover, epAttempt,
-            config.llmTimeoutSeconds)
-        if accepted:
+      ## Apply the sense before exposing its private window to any policy.
+      var anchor = -1
+      var senseFallback = false
+      if config.sense > 0:
+        var sense: Decision
+        var attempts: seq[DecisionAttempt]
+        if seatExternal:
+          let accepted = awaitExternalPhase(simCopy, mover, epSense, config.llmTimeoutSeconds)
           withLock stateLock:
-            decision = state.pendingDecision
+            attempts = state.externalAttempts
+            sense = if accepted: Decision(anchor: state.pendingSense, cell: -1)
+              else: scriptedPhase(simCopy, mover, seatBaseline, "sense")
+            sense.fellBack = not accepted or state.externalFallback
         else:
-          decision = scriptedDecision(simCopy, mover, seatBaseline)
-          decision.fellBack = true
-      else:
-        decision = client.decide(simCopy, mover, seatPrompt, seatBaseline,
-          scripted = seatScripted)
+          sense = client.decidePhase(simCopy, mover, seatPrompt, seatBaseline,
+            seatScripted, "sense")
+          attempts = client.attempts
+        anchor = sense.anchor
+        senseFallback = sense.fellBack
+        withLock stateLock:
+          state.sim.applySense(mover, anchor)
+          state.pendingSense = anchor
+          state.recordPhase(simCopy, mover, "sense", sense, attempts)
+          state.broadcastLocked()
+          simCopy = state.sim
 
+      var decision: Decision
+      var attempts: seq[DecisionAttempt]
+      if seatExternal:
+        let accepted = awaitExternalPhase(simCopy, mover, epAttempt, config.llmTimeoutSeconds)
+        withLock stateLock:
+          attempts = state.externalAttempts
+          decision = if accepted: state.pendingDecision
+            else: scriptedPhase(simCopy, mover, seatBaseline, "attempt", anchor)
+          decision.fellBack = not accepted or state.externalFallback
+      else:
+        decision = client.decidePhase(simCopy, mover, seatPrompt, seatBaseline,
+          seatScripted, "attempt", anchor)
+        attempts = client.attempts
       withLock stateLock:
-        if state.sim.done:
-          break
-        if decision.fellBack:
-          inc state.sim.fallbacks[mover]
-        var sensed = false
-        try:
-          ## 6. Sense, then 7-12. Attempt.
-          if config.sense > 0 and decision.anchor >= 0:
-            state.sim.applySense(mover, decision.anchor)
-            sensed = true
-          ## `decision.scripted`, not the seat's declared flag: with no
-          ## credentials the client disables itself and a prompt seat is
-          ## decided by the baseline too, and the event field means
-          ## "decided by a scripted baseline" (types.nim).
-          state.sim.applyAttempt(mover, decision.cell, decision.say,
-            decision.notes, decision.guess, decision.scripted,
-            decision.fellBack)
-          echo "fogboards: ply ", state.sim.plies, " ",
-            state.sim.names[mover], " plays ",
-            state.sim.cellName(decision.cell), " at ",
-            (epochTime() - gameStart).int, "s"
-        except CatchableError as error:
-          ## Degrade, never hang: an unusable decision is replaced by the
-          ## always-legal baseline rather than stalling the episode. The
-          ## probe in `decide` makes this unreachable in practice; if it
-          ## ever fires, the episode still has to advance or end.
-          echo "fogboards: decision rejected (", error.msg,
-            "); using the scripted fallback"
-          if not decision.fellBack:
-            inc state.sim.fallbacks[mover]
-          try:
-            let fallback = scriptedDecision(state.sim, mover, seatBaseline)
-            if config.sense > 0 and not sensed and fallback.anchor >= 0:
-              state.sim.applySense(mover, fallback.anchor)
-            state.sim.applyAttempt(mover, fallback.cell, "", "", @[],
-              fallback.scripted, true)
-          except CatchableError as fatal:
-            echo "fogboards: the baseline could not move either (",
-              fatal.msg, "); ending the episode"
-            state.sim.endEarly()
+        if state.sim.done: break
+        if decision.fellBack or senseFallback: inc state.sim.fallbacks[mover]
+        state.sim.applyAttempt(mover, decision.cell, decision.say, decision.notes,
+          decision.guess, decision.scripted, decision.fellBack or senseFallback)
+        state.recordPhase(simCopy, mover, "attempt", decision, attempts)
+        echo "fogboards: ply ", state.sim.plies, " ", state.sim.names[mover],
+          " plays ", state.sim.cellName(decision.cell), " at ",
+          (epochTime() - gameStart).int, "s"
         state.broadcastLocked()
 
       if config.turnDelayMs > 0:
@@ -590,27 +600,43 @@ proc websocketHandler(
           withLock stateLock:
             if state.external[slot] and state.pendingSeat == slot and
                 state.decisionId == id and not state.pendingAccepted:
-              case state.pendingPhase
-              of epSense:
-                let anchor = state.sim.parseCellNode(payload{"sense"})
-                if anchor notin state.sim.legalAnchors(slot):
-                  raise newException(FogError, "not a legal sense anchor")
-                state.pendingSense = anchor
-              of epAttempt:
-                var afterSense = state.sim
-                var reply = copy(payload)
-                if state.config.sense > 0:
-                  afterSense.applySense(slot, state.pendingSense)
-                  reply["sense"] = %state.sim.cellName(state.pendingSense)
-                let proposed = afterSense.parseReply(slot, reply)
-                if proposed.cell notin afterSense.legalAttempts(slot):
-                  raise newException(FogError, "not a legal cell attempt")
-                state.pendingDecision = proposed
-              of epNone:
+              var attempt = if payload.hasKey("training_attempt"):
+                readAttemptEvidence(payload["training_attempt"])
+                else: newDecisionAttempt("fog-external-" & $id & "-" &
+                  $state.externalAttempts.len, "external-fog", aoUnknown)
+              if attempt.origin == aoUnknown: attempt.response = copy(payload)
+              attempt.rejectionReason = some("external phase proposal not applied")
+              state.externalAttempts.add(attempt)
+              if state.pendingPhase == epNone:
                 raise newException(FogError, "no external decision pending")
+              let phase = $state.pendingPhase
+              let proposal = state.sim.phaseProposal(slot, $payload, phase, state.pendingSense)
+              var chosen: Decision
+              if proposal.accepted:
+                chosen = proposal.decision
+                state.externalAttempts[^1].parsedAction = state.sim.phaseAction(chosen, phase)
+                state.externalAttempts[^1].accepted = true
+                state.externalAttempts[^1].rejectionReason = none(string)
+              else:
+                inc state.externalRejections
+                state.externalAttempts[^1].rejectionReason = some(proposal.rejection)
+                if state.externalRejections == 1:
+                  websocket.send($(%*{"type": "rejected", "id": id, "phase": phase,
+                    "reason": proposal.rejection, "observation": observationJson(state.sim, slot),
+                    "messages": [{"role": "system", "content": systemPrompt(state.sim, slot)},
+                      {"role": "user", "content": userPrompt(state.sim, slot,
+                        state.prompts[slot], phase) & state.sim.retryHint(slot, phase)}]}))
+                  return
+                chosen = state.sim.scriptedPhase(slot, state.baselines[slot], phase, state.pendingSense)
+                state.externalFallback = true
+                websocket.send($(%*{"type": "consumed_rejection", "id": id,
+                  "phase": phase, "reason": proposal.rejection,
+                  "action": state.sim.phaseAction(chosen, phase)}))
+              if state.pendingPhase == epSense: state.pendingSense = chosen.anchor
+              else: state.pendingDecision = chosen
               state.pendingAccepted = true
       except CatchableError as error:
-        echo "fogboards: ignoring bad player frame: ", error.msg
+        echo "fogboards: ignoring invalid player frame"
     of ErrorEvent:
       discard
     of CloseEvent:
@@ -684,6 +710,10 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
     raise newException(FogError, "tokens and players must align")
   state.config = config
   state.sim = initSim(config)
+  if getEnv(CogameSaveTrajectoryUriEnv).len > 0:
+    state.trajectory = some(newDecisionTrajectory(getEnv("COWORLD_EPISODE_ID"),
+      "fog-" & $config.seed, "fog-of-war-boards", getEnv("COWORLD_GAME_VERSION"),
+      getEnv("COWORLD_SOURCE_REVISION")))
   state.prompts = newSeq[string](config.players.len)
   state.scripted = newSeq[bool](config.players.len)
   state.baselines = newSeq[Baseline](config.players.len)

@@ -604,7 +604,7 @@ proc boardStateJson*(sim: Sim): JsonNode =
       "sensedEmpty": sensed,
       "guess": guess,
       "say": sim.says[seat],
-      "notes": sim.notes[seat],
+      "notes": "",
       "scripted": sim.scripted[seat],
       "fellBack": sim.fellBack[seat]
     })
@@ -710,6 +710,11 @@ proc eventFromJson*(node: JsonNode): GameEvent =
 
 # ---- Replay bytes -----------------------------------------------------------
 
+proc publicEventJson*(event: GameEvent): JsonNode =
+  ## Private notes stay in engine state/trajectories, never spectator artifacts.
+  result = event.eventToJson()
+  if result.hasKey("notes"): result.delete("notes")
+
 proc replayPayloadJson*(sim: Sim, results: JsonNode): JsonNode =
   ## Self-sufficient replay bytes: names, policy names, the whole config,
   ## the seed, the ply cap, every event and the results. The viewer
@@ -724,7 +729,7 @@ proc replayPayloadJson*(sim: Sim, results: JsonNode): JsonNode =
     policyNames.add(%player.name)
   var events = newJArray()
   for event in sim.events:
-    events.add(event.eventToJson())
+    events.add(event.publicEventJson())
   %*{
     "protocol": "fogboards.replay.v1",
     "names": names,

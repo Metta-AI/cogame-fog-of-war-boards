@@ -1,0 +1,8 @@
+# Private training artifacts must never enter game or replay image contexts.
+**/*.jsonl
+**/qualification.json
+**/training-data/
+**/training-corpus/
+**/trajectories/
+.git
+nimcache

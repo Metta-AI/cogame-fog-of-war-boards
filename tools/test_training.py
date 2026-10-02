@@ -32,6 +32,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert all(run["plies"] > 0 and len(run["scores"]) == 2 for run in manifest["runs"])
         phases_by_episode: dict[str, list[str]] = {}
         for row in train + validation:
+            assert row["seed"] == "fog-" + row["episode_id"].rsplit("-", 1)[1]
             prompt = row["prompt"][1]["content"]
             view = row["observation"]
             assert view["name"] != view["opponentName"]

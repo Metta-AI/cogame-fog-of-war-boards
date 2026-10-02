@@ -75,7 +75,7 @@ when isMainModule:
         teacher.parsedAction = reply
         trajectory.recordDecision(decisionId, $seat, view, @[teacher],
           some(teacher.attemptId), reply, asAccepted, terminal = game.done)
-        rows.add($(%*{"episode_id": episodeId, "seed": episodeId,
+        rows.add($(%*{"episode_id": episodeId, "seed": "fog-" & $seed,
           "decision_id": decisionIndex, "phase": phase, "observation": view,
           "prompt": prompt, "completion": [{"role": "assistant", "content": $reply}],
           "game": "fog-of-war-boards", "action_schema_revision": "fogboards-player-v3"}))

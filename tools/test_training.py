@@ -22,7 +22,9 @@ with tempfile.TemporaryDirectory() as directory:
         train = [json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]
         validation = [json.loads(line) for line in (output / "validation.jsonl").read_text().splitlines()]
         events = [json.loads(line) for line in (output / "trajectories.jsonl").read_text().splitlines()]
-        assert sum(event["event_type"] == "episode" for event in events) == 10
+        episodes = [event for event in events if event["event_type"] == "episode"]
+        assert len(episodes) == 10
+        assert {event["seed_family"] for event in episodes} == {f"fog-{seed}" for seed in range(1, 11)}
         assert (output / "trajectories.jsonl").stat().st_mode & 0o777 == 0o600
         assert manifest["variant"] == variant and len(manifest["runs"]) == 10
         assert len(train) == manifest["train_examples"]

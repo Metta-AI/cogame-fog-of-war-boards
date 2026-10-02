@@ -40,7 +40,7 @@ when isMainModule:
     var game = initSim(config)
     var rows: seq[string]
     let episodeId = "fogboards-" & variant & "-" & $seed
-    let trajectory = newDecisionTrajectory(episodeId, episodeId,
+    let trajectory = newDecisionTrajectory(episodeId, "fog-" & $seed,
       "fog-of-war-boards", gameVersion, revision)
     var decisionIndex = 0
     while not game.done:

@@ -28,8 +28,6 @@ when isMainModule:
   setFilePermissions(output, {fpUserRead, fpUserWrite, fpUserExec})
   let revision = execProcess("git rev-parse HEAD").strip()
   var
-    trainRows: seq[string]
-    validationRows: seq[string]
     trajectoryRows: seq[string]
     runs = newJArray()
   for seed in 1 .. episodes:
@@ -38,7 +36,6 @@ when isMainModule:
     config.update($variantConfig)
     config = sampleEpisode(config)
     var game = initSim(config)
-    var rows: seq[string]
     let episodeId = "fogboards-" & variant & "-" & $seed
     let trajectory = newDecisionTrajectory(episodeId, "fog-" & $seed,
       "fog-of-war-boards", gameVersion, revision)
@@ -64,47 +61,30 @@ when isMainModule:
             accepted.guess, true, false)
         let decisionId = episodeId & "-" & $decisionIndex
         var teacher = newDecisionAttempt(decisionId & "-teacher", $baseline, aoTeacher)
-        teacher.model = some("scripted-" & $baseline)
-        teacher.modelIdentity = some(revision)
         teacher.prompt = prompt
-        teacher.request = %*{"teacher": $baseline, "observation": view, "phase": phase}
         teacher.response = %($reply)
-        teacher.rawResponse = %($reply)
-        teacher.decoder = %*{"method": "deterministic"}
         teacher.accepted = true
         teacher.parsedAction = reply
         trajectory.recordDecision(decisionId, $seat, view, @[teacher],
           some(teacher.attemptId), reply, asAccepted, terminal = game.done)
-        rows.add($(%*{"episode_id": episodeId, "seed": "fog-" & $seed,
-          "decision_id": decisionIndex, "phase": phase, "observation": view,
-          "prompt": prompt, "completion": [{"role": "assistant", "content": $reply}],
-          "game": "fog-of-war-boards", "action_schema_revision": "fogboards-player-v3"}))
         inc decisionIndex
     var outcomes = newJObject()
     for seat in 0 ..< Seats: outcomes[$seat] = resultsJson(game)["scores"][seat]
     trajectory.finish(esCompleted, resultsJson(game), outcomes)
     trajectoryRows.add(trajectory.eventsJsonl().strip())
     doAssert game.reason == "complete"
-    if seed mod 5 == 0:
-      validationRows.add(rows)
-    else:
-      trainRows.add(rows)
     runs.add(%*{"seed": seed, "plies": game.plies,
       "scores": resultsJson(game)["scores"]})
-  writeFile(output / "train.jsonl", trainRows.join("\n") & "\n")
-  writeFile(output / "validation.jsonl", validationRows.join("\n") & "\n")
-  writeFile(output / "trajectories.jsonl", trajectoryRows.join("\n") & "\n")
-  writeFile(output / "manifest.json", pretty(%*{
+  writePrivate(output / "trajectories.jsonl", trajectoryRows.join("\n") & "\n")
+  writePrivate(output / "manifest.json", pretty(%*{
     "schema_version": 1,
     "game": "fog-of-war-boards",
     "variant": variant,
     "game_version": gameVersion,
     "source_revision": revision,
     "teacher": "probe-vs-sweep",
-    "train_examples": trainRows.len,
-    "validation_examples": validationRows.len,
+    "episodes": episodes,
+    "dataset_path": "canonical-trajectories-only; shared reviewed importer owns splits",
     "runs": runs
   }) & "\n")
-  for name in ["train.jsonl", "validation.jsonl", "trajectories.jsonl", "manifest.json"]:
-    setFilePermissions(output / name, {fpUserRead, fpUserWrite})
-  echo "train=", trainRows.len, " validation=", validationRows.len
+  echo "complete games=", episodes

@@ -1,6 +1,7 @@
 """Prove that a normal player can use a sense result before choosing a cell."""
 
 import asyncio
+import contextlib
 import json
 import os
 import socket
@@ -21,39 +22,82 @@ VARIANTS = ("dark-hex-5", "recon-hex-5")
 async def play(slot: int, port: int, recon: bool, phases: dict[int, list[str]]) -> None:
     url = f"ws://127.0.0.1:{port}/player?slot={slot}&token=seat-{slot}"
     async with websockets.connect(url) as socket:
-        register = json.dumps({"type": "register", "control": "external"})
-        await socket.send(register)
+        register = json.dumps({"type": "register", "control": "external", "prompt": ""})
+        injected = set()
         async for raw in socket:
             packet = json.loads(raw)
             if packet["type"] == "welcome":
-                assert packet["protocol"] == "fogboards.player.v3"
+                assert packet["protocol"] == "fogboards.player.v4"
                 await socket.send(register)
-            elif packet["type"] == "observation":
+            elif packet["type"] in {"decision", "rejected"}:
+                retry = packet["type"] == "rejected"
+                if retry:
+                    packet = packet["observation"]
                 view = packet["observation"]
                 assert view["first"] == 0 and isinstance(view["ownProbes"], int)
                 assert view["opponentName"] != view["name"]
                 phase = packet["phase"]
-                phases[slot].append(phase)
+                if not retry:
+                    phases[slot].append(phase)
                 if phase == "sense":
                     assert recon
-                    anchor = "a2" if slot == 0 and view["ply"] == 2 else view["legalSenseAnchors"][0]
-                    reply = {"type": "action", "id": packet["id"], "sense": anchor}
+                    anchor = (
+                        "a2"
+                        if slot == 0 and view["ply"] == 2
+                        else view["legalSenseAnchors"][0]
+                    )
+                    reply = {"sense": anchor}
                 else:
                     assert phase == "attempt"
                     if recon and slot == 0 and view["ply"] == 2:
                         assert "b2" in view["provenOpponentStones"]
                         assert "b2" not in view["legalAttempts"]
-                        await socket.send(json.dumps({
-                            "type": "action", "id": packet["id"], "cell": "b2",
-                        }))
+                        if (view["ply"], phase) not in injected:
+                            injected.add((view["ply"], phase))
+                            await socket.send(
+                                json.dumps(
+                                    {
+                                        "type": "action",
+                                        "decision_id": packet["decision_id"],
+                                        "source": "unknown",
+                                        "action": {"cell": "b2"},
+                                        "training_attempt": None,
+                                    }
+                                )
+                            )
+                            continue
                     cell = (
-                        "a1" if slot == 0 and view["ply"] == 0 else
-                        "b2" if slot == 1 and view["ply"] == 1 else
-                        view["legalAttempts"][0]
+                        "a1"
+                        if slot == 0 and view["ply"] == 0
+                        else "b2"
+                        if slot == 1 and view["ply"] == 1
+                        else view["legalAttempts"][0]
                     )
-                    reply = {"type": "action", "id": packet["id"], "cell": cell}
-                await socket.send(json.dumps(reply))
-            elif packet["type"] == "final":
+                    reply = {"cell": cell}
+                await socket.send(
+                    json.dumps(
+                        {
+                            "type": "action",
+                            "decision_id": packet["decision_id"],
+                            "source": "unknown",
+                            "action": reply,
+                            "training_attempt": None,
+                        }
+                    )
+                )
+            elif packet["type"] == "stop":
+                await socket.send(
+                    json.dumps(
+                        {
+                            "type": "stopped",
+                            "decision_id": packet["decision_id"],
+                            "stop_id": packet["stop_id"],
+                            "worker_status": "no_active_call",
+                            "attempts": [],
+                        }
+                    )
+                )
+            elif packet["type"] == "evidence_received":
                 return
     raise RuntimeError(f"seat {slot} closed before final")
 
@@ -77,27 +121,49 @@ def main() -> None:
     manifest = json.loads((ROOT / "coworld_manifest_template.json").read_text())
     for variant in VARIANTS:
         recon = variant == "recon-hex-5"
-        config = next(row["game_config"] for row in manifest["variants"] if row["id"] == variant).copy()
-        config.update({
-            "tokens": ["seat-0", "seat-1"], "players": [{"name": "seat-0"}, {"name": "seat-1"}],
-            "seed": 21, "first": 0, "maxPlies": 4, "turnDelayMs": 0,
-            "llmTimeoutSeconds": 10, "player_connect_timeout_seconds": 30,
-        })
-        with tempfile.TemporaryDirectory() as directory:
+        config = next(
+            row["game_config"] for row in manifest["variants"] if row["id"] == variant
+        ).copy()
+        config.update(
+            {
+                "tokens": ["seat-0", "seat-1"],
+                "players": [{"name": "seat-0"}, {"name": "seat-1"}],
+                "seed": 21,
+                "first": 0,
+                "maxPlies": 4,
+                "turnDelayMs": 0,
+                "llmTimeoutSeconds": 10,
+                "player_connect_timeout_seconds": 30,
+            }
+        )
+        if len(sys.argv) == 3:
+            target = Path(sys.argv[2]) / (variant)
+            target.mkdir(parents=True, mode=0o700, exist_ok=False)
+            output_context = contextlib.nullcontext(target)
+        else:
+            output_context = tempfile.TemporaryDirectory()
+        with output_context as directory:
             output = Path(directory)
             (output / "config.json").write_text(json.dumps(config))
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
-            env = {key: value for key, value in os.environ.items()
-                   if not key.startswith(("ANTHROPIC_", "AWS_", "TYPESAFE_"))}
-            env.update({
-                "COGAME_HOST": "127.0.0.1", "COGAME_PORT": str(port),
-                "COGAME_CONFIG_URI": (output / "config.json").as_uri(),
-                "COGAME_RESULTS_URI": (output / "results.json").as_uri(),
-                "COGAME_SAVE_REPLAY_URI": (output / "replay.json").as_uri(),
-                "COGAME_PLAYER_FAILURE_URI": (output / "failure.json").as_uri(),
-            })
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith(("ANTHROPIC_", "AWS_", "TYPESAFE_"))
+            }
+            env.update(
+                {
+                    "COWORLD_LLM_PLY_SPACING_SECONDS": "0",
+                    "COGAME_HOST": "127.0.0.1",
+                    "COGAME_PORT": str(port),
+                    "COGAME_CONFIG_URI": (output / "config.json").as_uri(),
+                    "COGAME_RESULTS_URI": (output / "results.json").as_uri(),
+                    "COGAME_SAVE_REPLAY_URI": (output / "replay.json").as_uri(),
+                    "COGAME_PLAYER_FAILURE_URI": (output / "failure.json").as_uri(),
+                }
+            )
             game = subprocess.Popen([str(GAME)], cwd=ROOT, env=env)
             phases: dict[int, list[str]] = {0: [], 1: []}
             try:
@@ -107,8 +173,12 @@ def main() -> None:
                 replay = json.loads((output / "replay.json").read_text())
                 assert results["fallbacks"] == [0, 0]
                 assert results["plies"] == 4
-                assert sum(event["kind"] == "attempt" for event in replay["events"]) == 4
-                assert sum(event["kind"] == "sense" for event in replay["events"]) == (4 if recon else 0)
+                assert (
+                    sum(event["kind"] == "attempt" for event in replay["events"]) == 4
+                )
+                assert sum(event["kind"] == "sense" for event in replay["events"]) == (
+                    4 if recon else 0
+                )
                 expected = (["sense", "attempt"] if recon else ["attempt"]) * 2
                 assert all(seen == expected for seen in phases.values())
                 print(variant, results["plies"], results["fallbacks"], phases)

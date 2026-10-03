@@ -163,6 +163,7 @@ jobs:
           nim c --hints:off -d:release --path:src -o:/tmp/fogboards-game src/fogboards.nim
           nim c --hints:off -d:release --path:src -o:/tmp/fogboards-player src/fogboards_player.nim
           python3 tools/test_native_trajectory.py /tmp/fogboards-game /tmp/fogboards-player
+          python3 tools/test_native_lifecycle.py /tmp/fogboards-game /tmp/fogboards-player /tmp/fogboards-native-lifecycle
 
       - name: Exercise phased ordinary players
         run: |
@@ -170,6 +171,8 @@ jobs:
             -o:/tmp/fogboards-game src/fogboards.nim
           python3 -m venv /tmp/fogboards-player-venv
           /tmp/fogboards-player-venv/bin/pip install websockets==15.0.1
+          /tmp/fogboards-player-venv/bin/python tools/test_prompt_player.py \
+            /tmp/fogboards-player /tmp/fogboards-prompt-player
           /tmp/fogboards-player-venv/bin/python tools/test_external_player.py \
             /tmp/fogboards-game
           /tmp/fogboards-player-venv/bin/python tools/test_attempt_origins.py \

@@ -19,5 +19,5 @@ COPY . .
 # The wasm module only uses the Nim stdlib plus fogboards/sim, so no
 # package sync is needed. Drop the host machine's package paths.
 RUN rm -f nim.cfg && \
-  nim c --hints:off -d:emscripten replay-viewer/fogboards_replay.nim && \
+  nim c --parallelBuild:1 --hints:off -d:emscripten replay-viewer/fogboards_replay.nim && \
   test -s replay-viewer/dist/fogboards_replay.wasm

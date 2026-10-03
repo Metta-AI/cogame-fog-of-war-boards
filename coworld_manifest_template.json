@@ -127,7 +127,7 @@
           "default": 1200
         },
         "plySpacingSeconds": {
-          "description": "Minimum wall-clock between the starts of two LLM-driven plies. 0 derives 4 s, the Bedrock sidecar's 30-requests-per-minute floor at two requests per ply.",
+          "description": "Minimum wall-clock between starts of model-driven plies. 0 derives 4 s, or 8 s with reconnaissance.",
           "type": "integer",
           "minimum": 0,
           "maximum": 60,
@@ -143,7 +143,7 @@
         "model": {
           "description": "Claude model that drives every LLM seat.",
           "type": "string",
-          "default": "claude-sonnet-5"
+          "default": "anthropic/claude-haiku-4.5"
         },
         "maxOutputTokens": {
           "type": "integer",

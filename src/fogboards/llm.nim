@@ -7,25 +7,16 @@
 ## seat never sees the true board, and neither does this module's prompt
 ## builder — every number in a prompt comes from `believedBoard`.
 ##
-## Credentials, in order of preference:
-##   COWORLD_LLM_ENDPOINT            - hosted sidecar
-##   Bedrock bearer token            - local play
-##   ANTHROPIC_API_KEY                - the key itself
-##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## `probe` baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing.
+## The native sidecar is the sole model transport. A missing endpoint selects
+## the unsupervised game-owned probe fallback.
 
 import
-  std/[json, math, options, os, sets, strutils, tables, unicode],
-  bitworld/runtime, bitworld/decision_trajectory,
-  curly,
+  std/[base64, json, math, monotimes, options, os, sets, strutils, tables, unicode],
+  bitworld/decision_trajectory, bitworld/native_http, bitworld/native_stop,
   sim
 
 const
-  AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
-  BedrockAnthropicVersion = "bedrock-2023-05-31"
   ## Caps, in RUNES. Every one of them is cut on a rune boundary by
   ## `cleanText`: a byte-boundary cut renders in a browser and fails a
   ## strict JSON parser, which is exactly how a replay becomes unreadable.
@@ -34,11 +25,10 @@ const
   MaxGuessCells* = 6
   MaxGuessLen* = 4
   MaxErrorLen* = 200
-  ## The Bedrock sidecar caps 30 requests per minute per episode; a ply
-  ## issues at most two (the call plus one retry), so LLM-driven plies may
-  ## start no closer together than this.
+  ## Native request pacing preserves the existing base ply interval;
+  ## reconnaissance scales it for its separate sense phase.
   DerivedPlySpacingSeconds* = 4
-  ## A ply's worst case: two calls at the timeout, plus apply/broadcast.
+  ## A ply's worst case: its phase deadlines, plus apply/broadcast.
   ## Step 2 of the resolution order refuses to open a ply that cannot fit.
   PlyGuardSlackSeconds* = 2
   ## The staleness after which `probe` treats a sensed-empty cell as worth
@@ -61,25 +51,14 @@ type
     blProbe = "probe"
     blSweep = "sweep"
 
-  LlmTransport = enum
-    ltNone, ltSidecar, ltBedrock, ltAnthropic
-
   LlmClient* = ref object
     lastAttempt*: DecisionAttempt
     attempts*: seq[DecisionAttempt]
-    curl: Curly
-    transport: LlmTransport
-    apiKey: string
     sidecarEndpoint: string
-    bedrockEndpoint: string
-    bedrockModels: seq[string]
-    bedrockModel: int
-    bedrockToken: string
     temperature: float
     model: string
     maxOutputTokens: int
-    timeoutSeconds: int
-    disabled*: bool     ## true once credentials are known-unavailable
+    disabled*: bool
 
 proc parseBaseline*(text: string): Baseline =
   ## `1`, `true` and `yes` are accepted synonyms for `probe`.
@@ -89,89 +68,16 @@ proc parseBaseline*(text: string): Baseline =
   else:
     raise newException(FogError, "unknown scripted baseline: " & text)
 
-proc resolveApiKey(): string =
-  result = getEnv("ANTHROPIC_API_KEY").strip()
-  if result.len > 0:
-    return
-  let uri = getEnv("ANTHROPIC_API_KEY_URI").strip()
-  if uri.len == 0:
-    return ""
-  try:
-    result = readCogameUri(uri, "ANTHROPIC_API_KEY_URI").strip()
-  except CatchableError as error:
-    echo "fogboards llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
-    result = ""
-
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id. Haiku leads: hosted Bedrock capacity is shared
-  ## account-wide and the sonnet profiles run out of daily tokens first.
-  ## `us.anthropic.claude-sonnet-4-6` is deliberately NOT a candidate: it
-  ## times out on every sidecar call, and one throttle then cascades into
-  ## scripted fallbacks for the rest of the episode (raid, 2026-08-23).
-  let pinned = getEnv("BEDROCK_MODEL").strip()
-  if pinned.len > 0:
-    return @[pinned]
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "fogboards llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
-
-proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
-
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
-    model: config.model,
+    model: getEnv("COWORLD_LLM_MODEL", config.model),
     maxOutputTokens: config.maxOutputTokens,
-    temperature: getEnv("COWORLD_LLM_TEMPERATURE", "1").parseFloat(),
-    timeoutSeconds: config.llmTimeoutSeconds
-  )
+    temperature: getEnv("COWORLD_LLM_TEMPERATURE", "1").parseFloat())
   if classify(result.temperature) in {fcNan, fcInf, fcNegInf} or
       result.temperature < 0 or result.temperature > 1:
     raise newException(ValueError, "COWORLD_LLM_TEMPERATURE must be finite and in 0..1")
-  let sidecarEndpoint = getEnv("COWORLD_LLM_ENDPOINT").strip()
-  if sidecarEndpoint.len > 0:
-    result.transport = ltSidecar
-    result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
-    result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
-    result.curl = newCurly()
-    return
-  let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
-  let bedrockToken = getEnv("AWS_BEARER_TOKEN_BEDROCK").strip()
-  if bedrockEndpoint.len > 0 or bedrockToken.len > 0:
-    let region = getEnv("AWS_REGION",
-      getEnv("AWS_DEFAULT_REGION", "us-west-2"))
-    let endpoint =
-      if bedrockEndpoint.len > 0: bedrockEndpoint
-      else: "https://bedrock-runtime." & region & ".amazonaws.com"
-    result.transport = ltBedrock
-    result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
-    result.bedrockToken = bedrockToken
-    result.curl = newCurly()
-    echo "fogboards llm: bedrock transport, url ", result.bedrockUrl
-    return
-  result.apiKey = resolveApiKey()
-  if result.apiKey.len > 0:
-    result.transport = ltAnthropic
-    result.curl = newCurly()
-    echo "fogboards llm: anthropic transport, model ", result.model
-  else:
-    result.transport = ltNone
-    result.disabled = true
-    echo "fogboards llm: no LLM credentials; using scripted fallback"
+  result.sidecarEndpoint = getEnv("COWORLD_LLM_ENDPOINT").strip().strip(chars = {'/'}, leading = false)
+  result.disabled = result.sidecarEndpoint.len == 0
 
 # ---- Text hygiene -----------------------------------------------------------
 
@@ -432,8 +338,7 @@ proc refereeLog*(sim: Sim, seat: int): string =
 
 proc systemPrompt*(sim: Sim, seat: int): string =
   ## One system prompt per mode, identical for both seats: the rules
-  ## verbatim, the seat's alias, and the output contract. Bedrock Haiku
-  ## answers prose-first without the last paragraph.
+  ## verbatim, the seat's alias, and the output contract.
   let n = sim.config.size
   let lastFile = $chr(ord('a') + n - 1)
   result.add("You are " & sim.names[seat] & ", a cog playing " &
@@ -667,100 +572,159 @@ proc parseReply*(sim: Sim, seat: int, payload: JsonNode): Decision =
       if cell notin result.guess:
         result.guess.add(cell)
 
-# ---- Anthropic / Bedrock transport ------------------------------------------
+# ---- Native sidecar transport -----------------------------------------------
 
-proc completeText(client: LlmClient, system, user: string, slot: int): string =
-  var body = %*{
-    "max_tokens": client.maxOutputTokens,
-    "temperature": client.temperature,
-    "system": system,
-    "messages": [{"role": "user", "content": user}]
-  }
+proc completeText(client: LlmClient, system, user: string, slot: int,
+    deadline: MonoTime): string =
+  let body = %*{"max_tokens": client.maxOutputTokens,
+    "temperature": client.temperature, "model": client.model,
+    "system": system, "messages": [{"role": "user", "content": user}]}
   var headers: HttpHeaders
-  if client.transport == ltSidecar and slot >= 0:
-    headers["X-Coworld-Player-Slot"] = $slot
   headers["content-type"] = "application/json"
-  var url: string
-  if client.transport == ltBedrock:
-    body["anthropic_version"] = %BedrockAnthropicVersion
-    if client.bedrockToken.len > 0:
-      headers["authorization"] = "Bearer " & client.bedrockToken
-    url = client.bedrockUrl()
-  elif client.transport == ltSidecar:
-    body["model"] = %client.model
-    headers["anthropic-version"] = AnthropicVersion
-    url = client.sidecarEndpoint & "/v1/messages"
-  else:
-    body["model"] = %client.model
-    ## Only the Claude 5 / Opus tiers accept an effort setting; Haiku 4.5
-    ## rejects the whole request with a 400 if it is present.
-    if "haiku" notin client.model and "4-5" notin client.model:
-      body["output_config"] = %*{"effort": "low"}
-    headers["x-api-key"] = client.apiKey
-    headers["anthropic-version"] = AnthropicVersion
-    url = AnthropicUrl
+  headers["anthropic-version"] = AnthropicVersion
+  headers["X-Coworld-Player-Slot"] = $slot
+  let url = client.sidecarEndpoint & "/v1/messages"
   client.lastAttempt.prompt = %*[{"role": "system", "content": system},
     {"role": "user", "content": user}]
   client.lastAttempt.request = copy(body)
-  client.lastAttempt.model = some(if client.transport == ltBedrock:
-    client.bedrockModels[client.bedrockModel] else: client.model)
+  client.lastAttempt.model = some(client.model)
   client.lastAttempt.decoder = %*{"temperature": client.temperature,
     "max_tokens": client.maxOutputTokens}
-  let response = client.curl.post(url, headers, $body, client.timeoutSeconds)
-  client.lastAttempt.rawResponse = %response.body
-  if response.headers.contains("X-Softmax-Llm-Call-Id"):
-    client.lastAttempt.platformCallId = some(response.headers["X-Softmax-Llm-Call-Id"])
-  for header in ["X-Coworld-Checkpoint-Sha256", "X-Coworld-Tokenizer-Sha256",
-      "X-Coworld-Chat-Template-Sha256"]:
-    if response.headers.contains(header):
-      case header
-      of "X-Coworld-Checkpoint-Sha256": client.lastAttempt.modelIdentity = some(response.headers[header])
-      of "X-Coworld-Tokenizer-Sha256": client.lastAttempt.tokenizerIdentity = some(response.headers[header])
-      else: client.lastAttempt.chatTemplateSha256 = some(response.headers[header])
-  if response.code == 401 or response.code == 403:
-    ## Rune-safe, never a byte slice: an HTTP body cut at a byte offset can
-    ## end in half a rune, and this text goes on to stdout.
-    let detail = cleanText(response.body.replace("\n", " "), MaxErrorLen)
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(FogError, "bedrock model access denied: " & detail)
+  let response = performNativePost(url, headers, $body, deadline)
+  client.lastAttempt.latencyMs = response.latencyMs
+  client.lastAttempt.responseReaderJoined = response.responseReaderJoined
+  let observedResponse = response.httpStatus.isSome or response.headerBytes.len > 0 or response.bodyBytes.len > 0
+  if observedResponse:
+    client.lastAttempt.responseBodyB64 = some(encode(response.bodyBytes))
+    client.lastAttempt.responseHeadersB64 = some(encode(response.headerBytes))
+    client.lastAttempt.responseComplete = some(response.transferComplete)
+    client.lastAttempt.httpStatus = response.httpStatus
+    if validateUtf8(response.bodyBytes) == -1:
+      client.lastAttempt.rawResponse = %response.bodyBytes
+  if validateUtf8(response.headerBytes) != -1:
+    raise newException(FogError, "received HTTP headers are not valid UTF-8")
+  var responseHeaders: HttpHeaders
+  var receivedHeaders = initTable[string, string]()
+  var identityHeaders = initHashSet[string]()
+  for line in response.headerBytes.splitLines():
+    if line.startsWith("HTTP/"):
+      responseHeaders.setLen(0)
+      receivedHeaders.clear()
+      identityHeaders.clear()
+    elif line.len > 0:
+      let colon = line.find(':')
+      if colon <= 0:
+        raise newException(FogError, "invalid received HTTP header")
+      let name = line[0 ..< colon]
+      let value = line[colon + 1 .. ^1].strip()
+      let normalized = name.toLowerAscii()
+      if normalized in ["request-id", "x-request-id", "x-softmax-llm-call-id",
+          "x-coworld-checkpoint-sha256", "x-coworld-tokenizer-sha256",
+          "x-coworld-chat-template-sha256"]:
+        if normalized in identityHeaders:
+          raise newException(FogError, "duplicate received identity header")
+        identityHeaders.incl(normalized)
+      responseHeaders.add((name, value))
+      receivedHeaders[name] = value
+  if observedResponse:
+    client.lastAttempt.responseHeaders = some(receivedHeaders)
+  if responseHeaders.contains("request-id") and responseHeaders.contains("x-request-id") and
+      responseHeaders["request-id"] != responseHeaders["x-request-id"]:
+    raise newException(FogError, "conflicting received request identity headers")
+  for key in ["request-id", "x-request-id"]:
+    if responseHeaders.contains(key):
+      client.lastAttempt.providerRequestId = some(responseHeaders[key])
+      break
+  for (header, field) in [
+      ("x-softmax-llm-call-id", "call"),
+      ("x-coworld-checkpoint-sha256", "model"),
+      ("x-coworld-tokenizer-sha256", "tokenizer"),
+      ("x-coworld-chat-template-sha256", "template")]:
+    if responseHeaders[header].len > 0:
+      case field
+      of "call":
+        let identity = responseHeaders[header]
+        if identity.len != 36:
+          raise newException(FogError, "received platform call identity is not a UUID")
+        for index, character in identity:
+          if index in [8, 13, 18, 23]:
+            if character != '-':
+              raise newException(FogError, "received platform call identity is not a UUID")
+          elif character notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+            raise newException(FogError, "received platform call identity is not a UUID")
+        client.lastAttempt.platformCallId = some(identity)
+      of "model": client.lastAttempt.modelIdentity = some(responseHeaders[header])
+      of "tokenizer": client.lastAttempt.tokenizerIdentity = some(responseHeaders[header])
+      else: client.lastAttempt.chatTemplateSha256 = some(responseHeaders[header])
+  if response.kind != nhComplete:
+    raise newException(FogError, "native transport " & $response.kind)
+  let status = response.httpStatus.get()
+  if status == 401 or status == 403:
     client.disabled = true
-    raise newException(FogError,
-      "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
-  if response.code == 429:
-    let detail = cleanText(response.body.replace("\n", " "), MaxErrorLen)
-    discard client.tryNextBedrockModel("throttled")
-    raise newException(FogError, "llm throttled (429): " & detail)
-  if response.code < 200 or response.code >= 300:
-    raise newException(FogError, "anthropic error " & $response.code &
-      ": " & cleanText(response.body.replace("\n", " "), MaxErrorLen))
-  let payload = parseJson(response.body)
-  if payload.hasKey("model"):
-    client.lastAttempt.model = some(payload["model"].getStr())
-  client.lastAttempt.stopReason = some(payload["stop_reason"].getStr())
+    raise newException(FogError, "native inference auth failed (" & $status & ")")
+  if status == 429:
+    raise newException(FogError, "native inference throttled (429)")
+  if status < 200 or status >= 300:
+    raise newException(FogError, "native inference error " & $status)
+  let payload = parseJson(response.bodyBytes)
+  if payload.kind != JObject or payload["model"].kind != JString or
+      payload["content"].kind != JArray:
+    raise newException(FogError, "native response violates the completion schema")
+  client.lastAttempt.model = some(payload["model"].getStr())
+  case payload["stop_reason"].kind
+  of JString: client.lastAttempt.stopReason = some(payload["stop_reason"].getStr())
+  of JNull: discard
+  else: raise newException(FogError, "native stop reason must be text or null")
+  if payload.hasKey("usage") and payload["usage"].kind != JNull:
+    let usage = payload["usage"]
+    if usage.kind != JObject or usage["input_tokens"].kind != JInt or
+        usage["output_tokens"].kind != JInt or usage["input_tokens"].getInt() < 0 or
+        usage["output_tokens"].getInt() < 0:
+      raise newException(FogError, "native usage must contain nonnegative integer counts")
+    client.lastAttempt.inputTokens = some(usage["input_tokens"].getInt())
+    client.lastAttempt.outputTokens = some(usage["output_tokens"].getInt())
   if payload.hasKey("sampling_evidence") and payload["sampling_evidence"].kind != JNull:
     let sampling = payload["sampling_evidence"]
+    if sampling.kind != JObject or sampling["prompt_token_ids"].kind != JArray or
+        sampling["completion_token_ids"].kind != JArray or sampling["stop_reason"].kind != JString:
+      raise newException(FogError, "native sampling evidence violates the token schema")
     var promptIds, sampledIds: seq[int]
     var probabilities: seq[float]
-    for token in sampling["prompt_token_ids"]: promptIds.add(token.getInt())
-    for token in sampling["completion_token_ids"]: sampledIds.add(token.getInt())
+    for token in sampling["prompt_token_ids"]:
+      if token.kind != JInt or token.getInt() < 0:
+        raise newException(FogError, "native prompt token IDs must be nonnegative integers")
+      promptIds.add(token.getInt())
+    for token in sampling["completion_token_ids"]:
+      if token.kind != JInt or token.getInt() < 0:
+        raise newException(FogError, "native sampled token IDs must be nonnegative integers")
+      sampledIds.add(token.getInt())
     if sampling["behavior_log_probs"].kind != JNull:
-      for probability in sampling["behavior_log_probs"]: probabilities.add(probability.getFloat())
+      if sampling["behavior_log_probs"].kind != JArray:
+        raise newException(FogError, "native draw probabilities must be an array or null")
+      for probability in sampling["behavior_log_probs"]:
+        if probability.kind notin {JInt, JFloat} or
+            classify(probability.getFloat()) in {fcNan, fcInf, fcNegInf} or probability.getFloat() > 0:
+          raise newException(FogError, "native draw probabilities must be finite nonpositive numbers")
+        probabilities.add(probability.getFloat())
+      if probabilities.len != sampledIds.len:
+        raise newException(FogError, "native draw probabilities must match sampled token IDs")
     client.lastAttempt.promptTokenIds = some(promptIds)
     client.lastAttempt.sampledTokenIds = some(sampledIds)
     if sampling["behavior_log_probs"].kind != JNull:
       client.lastAttempt.behaviorLogprobs = some(probabilities)
     client.lastAttempt.stopReason = some(sampling["stop_reason"].getStr())
-    client.lastAttempt.decoder["sampling_evidence"] = copy(sampling)
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(FogError, "anthropic refusal")
+    raise newException(FogError, "native inference refusal")
   for contentBlock in payload["content"]:
-    if contentBlock{"type"}.getStr() == "text":
-      result.add(contentBlock{"text"}.getStr())
+    if contentBlock.kind != JObject or contentBlock["type"].kind != JString:
+      raise newException(FogError, "native content block violates the completion schema")
+    if contentBlock["type"].getStr() == "text":
+      if contentBlock["text"].kind != JString:
+        raise newException(FogError, "native text content must be text")
+      result.add(contentBlock["text"].getStr())
   client.lastAttempt.response = %result
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(FogError, "reply cut off at max_tokens before " &
-      "any JSON: " & cleanText(result.replace("\n", " "), 160))
+    raise newException(FogError, "native reply ended before a JSON action")
 
 proc retryHint*(sim: Sim, seat: int, phase: string): string =
   ## Printing the legal set — computed by the SAME predicate the validator
@@ -821,7 +785,7 @@ proc phaseProposal*(sim: Sim, seat: int, response: string, phase: string,
     result.rejection = error.msg
 
 proc decidePhase*(client: LlmClient, sim: Sim, seat: int, prompt: string,
-    baseline: Baseline, scripted: bool, phase: string, anchor = -1): Decision =
+    baseline: Baseline, scripted: bool, phase: string, deadline: MonoTime, anchor = -1): Decision =
   ## The server applies sense before rendering the next private attempt prompt.
   client.attempts = @[]
   if scripted or client.disabled:
@@ -829,12 +793,13 @@ proc decidePhase*(client: LlmClient, sim: Sim, seat: int, prompt: string,
     return
   let system = systemPrompt(sim, seat)
   for index in 0 .. 1:
+    if interruptionRequested() or getMonoTime() >= deadline: break
     var user = userPrompt(sim, seat, prompt, phase)
     if index > 0: user.add(sim.retryHint(seat, phase))
     client.lastAttempt = newDecisionAttempt("fog-" & $sim.plies & "-" &
       $seat & "-" & phase & "-" & $index, "fog-prompt", aoModel)
     try:
-      let proposal = phaseProposal(sim, seat, client.completeText(system, user, seat), phase, anchor)
+      let proposal = phaseProposal(sim, seat, client.completeText(system, user, seat, deadline), phase, anchor)
       if proposal.accepted:
         result = proposal.decision
         client.lastAttempt.parsedAction = sim.phaseAction(result, phase)
@@ -852,15 +817,15 @@ proc decidePhase*(client: LlmClient, sim: Sim, seat: int, prompt: string,
   result.fellBack = true
 
 proc decide*(client: LlmClient, sim: Sim, seat: int, prompt: string,
-    baseline: Baseline, scripted: bool): Decision =
+    baseline: Baseline, scripted: bool, deadline: MonoTime): Decision =
   ## Offline callers follow the same two phases on their private simulator.
   var after = sim
   var anchor = -1
   var senseFallback = false
   if sim.config.sense > 0:
-    let sense = client.decidePhase(sim, seat, prompt, baseline, scripted, "sense")
+    let sense = client.decidePhase(sim, seat, prompt, baseline, scripted, "sense", deadline)
     anchor = sense.anchor
     senseFallback = sense.fellBack
     after.applySense(seat, anchor)
-  result = client.decidePhase(after, seat, prompt, baseline, scripted, "attempt", anchor)
+  result = client.decidePhase(after, seat, prompt, baseline, scripted, "attempt", deadline, anchor)
   result.fellBack = result.fellBack or senseFallback

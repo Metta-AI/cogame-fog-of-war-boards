@@ -31,7 +31,8 @@ type
     turnDelayMs*: int
     playerConnectTimeoutSeconds*: float
     model*: string
-    maxOutputTokens*, llmTimeoutSeconds*: int
+    maxOutputTokens*: int
+    llmTimeoutSeconds*: int       ## one phase budget, including its repair request
     sampled*: bool                ## true once the budget fit has been applied
 
   Occupant* = enum
@@ -82,7 +83,7 @@ proc defaultGameConfig*(): GameConfig =
     plySpacingSeconds: 0,
     turnDelayMs: 250,
     playerConnectTimeoutSeconds: 180,
-    model: "claude-sonnet-5",
+    model: "anthropic/claude-haiku-4.5",
     maxOutputTokens: 900,
     llmTimeoutSeconds: 30
   )
@@ -90,6 +91,8 @@ proc defaultGameConfig*(): GameConfig =
 proc validate*(config: GameConfig) =
   ## Every rejection names the field and the value: a hosted episode that
   ## dies on a bad variant should say which knob was wrong.
+  if config.llmTimeoutSeconds <= 0:
+    raise newException(FogError, "llmTimeoutSeconds must be positive")
   if config.players.len != Seats:
     raise newException(FogError,
       "fog-of-war-boards needs exactly " & $Seats & " players, got " &

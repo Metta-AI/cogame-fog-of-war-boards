@@ -21,14 +21,18 @@ mkdir -p "$(dirname "${output_dir}")"
 
 export PATH="$HOME/.nimby/nim/bin:$PATH"
 
-if command -v emcc >/dev/null && command -v nim >/dev/null; then
+pinned_emscripten="$(sed -n 's/^FROM emscripten\/emsdk:\([^ ]*\).*/\1/p' "$repo_dir/Dockerfile.replay-viewer")"
+pinned_nim="$(sed -n 's/.*nimby use \([0-9.]*\).*/\1/p' "$repo_dir/Dockerfile.replay-viewer")"
+if command -v emcc >/dev/null && command -v nim >/dev/null &&
+   [[ "$(emcc --version | sed -n '1s/.*) \([0-9.]*\).*/\1/p')" == "$pinned_emscripten" ]] &&
+   [[ "$(nim --version | sed -n '1s/^Nim Compiler Version \([^ ]*\).*/\1/p')" == "$pinned_nim" ]]; then
   # Local toolchain: build the wasm module directly.
-  (cd "${repo_dir}" && nim c --hints:off -d:emscripten \
+  (cd "${repo_dir}" && nim c --parallelBuild:1 --hints:off -d:emscripten \
     replay-viewer/fogboards_replay.nim)
 else
   # Fall back to the pinned emsdk container.
   image_tag="fogboards-replay-viewer-build:$$"
-  docker build --platform linux/amd64 \
+  docker build --load --platform linux/amd64 \
     --file "${repo_dir}/Dockerfile.replay-viewer" \
     --tag "${image_tag}" "${repo_dir}"
   container_id="$(docker create "${image_tag}")"

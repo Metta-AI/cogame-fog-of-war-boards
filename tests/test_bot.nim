@@ -190,21 +190,20 @@ suite "the baselines are legal, blind and bounded":
       " ms against a 10 s soak"
     check playback >= 13_000
 
-suite "the ladder degrades, never hangs":
-  test "with no credentials every seat is decided by the baseline at once":
+suite "native endpoint availability":
+  test "without a native endpoint every seat uses the baseline":
     let config = fixture(mDarkHex, 5, seed = 5)
     let client = newLlmClient(config)
-    ## No key in the test environment: the client disables itself once and
-    ## every later decision is scripted immediately — no retries, no
-    ## network waits. This is what makes offline certification complete.
+    ## An absent native endpoint makes offline certification use the
+    ## baseline immediately, without network requests or teacher authority.
     check client.disabled
     var sim = initSim(config)
     let mover = sim.beginPly()
     let decision = client.decide(sim, mover, "take the middle", blProbe,
-      scripted = false)
+      scripted = false, deadline = getMonoTime() + initDuration(seconds = 1))
     check decision.cell == scriptedDecision(sim, mover, blProbe).cell
     check not decision.fellBack
-    let sweep = client.decide(sim, mover, "", blSweep, scripted = true)
+    let sweep = client.decide(sim, mover, "", blSweep, scripted = true, deadline = getMonoTime() + initDuration(seconds = 1))
     check sweep.cell == scriptedDecision(sim, mover, blSweep).cell
 
   test "a scripted seat name is parsed the way the player sends it":

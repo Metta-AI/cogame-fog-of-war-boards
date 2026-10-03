@@ -12,14 +12,13 @@
 ##   GET /client/chrome_common.js    - the inherited broadcast chrome
 ##   GET /client/chrome.css
 ##   GET /client/assets/<name>       - sprites and fonts
-##   WS  /player?slot=N&token=T      - fogboards.player.v2
+##   WS  /player?slot=N&token=T      - fogboards.player.v4
 ##   WS  /global                     - spectator snapshots
 ##   WS  /replay                     - the replay payload (replay mode)
 
 import
-  std/[json, locks, options, os, sets, strutils, tables, times],
-  bitworld/runtime, bitworld/decision_trajectory,
-  curly,
+  std/[base64, json, locks, math, monotimes, options, os, sets, strutils, sysrand, tables, times],
+  bitworld/runtime, bitworld/decision_trajectory, bitworld/native_stop, bitworld/artifact_runtime,
   mummy,
   mummy/routers,
   llm,
@@ -43,6 +42,16 @@ type
     epSense = "sense"
     epAttempt = "attempt"
 
+  PendingPhase = object
+    decisionId, seat: string
+    observation: JsonNode
+    attempts: seq[DecisionAttempt]
+    selected: Option[string]
+    action: JsonNode
+    status: ActionStatus
+    terminal: bool
+    fallbackOrigin: Option[string]
+
   GameState = object
     trajectory: Option[DecisionTrajectory]
     externalAttempts: seq[DecisionAttempt]
@@ -56,6 +65,18 @@ type
     external: seq[bool]
     registered: seq[bool]
     decisionId: int
+    pendingId: string
+    phaseDeadline: MonoTime
+    issuedSeats: Table[string, int]
+    issuedAt: Table[string, MonoTime]
+    issuedPrompts: Table[string, JsonNode]
+    latestDecisions: Table[int, string]
+    startedAttempts, completedAttempts: Table[string, JsonNode]
+    pendingPhases: seq[PendingPhase]
+    stopping: bool
+    stopId: string
+    stopIssuedAt, acknowledgementDeadline: MonoTime
+    stoppedSlots: HashSet[int]
     pendingSeat: int
     pendingPhase: ExternalPhase
     pendingSense: int
@@ -149,20 +170,18 @@ proc broadcastLocked(gs: GameState) =
   for slot, socket in gs.playerSockets:
     socket.send($gs.playerStateJson(slot))
 
-proc writeArtifact(uri, data, contentType, methodEnv: string) =
-  ## Writes a Coworld artifact, honoring the platform's PUT/POST method hint.
-  if uri.len == 0:
-    return
-  let httpMethod = getEnv(methodEnv, "PUT").toUpperAscii()
-  if uri.isHttpCogameUri() and httpMethod == "POST":
-    let curl = newCurly()
-    var headers: HttpHeaders
-    headers["content-type"] = contentType
-    let response = curl.post(uri, headers, data, 60)
-    if response.code < 200 or response.code >= 300:
-      raise newException(IOError, "artifact POST failed: " & $response.code)
-  else:
-    writeCogameUri(uri, data, contentType, methodEnv)
+proc writeArtifact(uri, data, contentType, methodEnv: string, cleanupDeadline: MonoTime) =
+  if uri.len == 0: return
+  let verb = getEnv(methodEnv, "PUT").toUpperAscii()
+  let httpMethod = case verb
+    of "PUT": ahPut
+    of "POST": ahPost
+    else: raise newException(ValueError, "unsupported artifact method")
+  writeCogameArtifact(uri, data, contentType, methodEnv, cleanupDeadline, httpMethod)
+
+proc waitUntil(deadline: MonoTime) =
+  while getMonoTime() < deadline and not interruptionRequested():
+    sleep(int(min(10'i64, max(1'i64, (deadline - getMonoTime()).inMilliseconds))))
 
 proc replayPayload(gs: GameState, results: JsonNode): string =
   ## The pure writer in `sim`, so the bytes CI validates are the bytes the
@@ -175,63 +194,175 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
   for frame in replayMatch(config, events):
     result.add(frame.boardStateJson())
 
-proc finishEpisode(runtimeConfig: RuntimeConfig) =
-  var results: JsonNode
+proc retainExternalAttempt(gs: var GameState, seat: int, id: string,
+    evidence: JsonNode, completed: bool) =
+  if not gs.issuedSeats.hasKey(id) or gs.issuedSeats[id] != seat:
+    raise newException(FogError, "attempt does not belong to authenticated issued seat")
+  let attempt = readAttemptEvidence(evidence)
+  if attempt.attemptId != id & "-model" or attempt.origin != aoModel:
+    raise newException(FogError, "external attempt must identify its issued model call")
+  let prompt = gs.issuedPrompts[id]
+  if attempt.prompt != prompt or attempt.request.kind != JObject or
+      attempt.request["system"] != prompt[0]["content"] or
+      attempt.request["messages"] != %*[prompt[1]]:
+    raise newException(FogError, "model call rewrites the exact private prompt")
+  if not gs.startedAttempts.hasKey(id):
+    if completed:
+      raise newException(FogError, "completed model evidence lacks pre-request start")
+    if attempt.response.kind != JNull or attempt.rawResponse.kind != JNull or
+        attempt.platformCallId.isSome or attempt.providerRequestId.isSome or
+        attempt.responseHeaders.isSome or attempt.responseHeadersB64.isSome or
+        attempt.responseBodyB64.isSome or attempt.responseComplete.isSome or
+        attempt.responseReaderJoined.isSome or attempt.httpStatus.isSome or
+        attempt.latencyMs.isSome or attempt.inputTokens.isSome or attempt.outputTokens.isSome or
+        attempt.promptTokenIds.isSome or attempt.sampledTokenIds.isSome or
+        attempt.behaviorLogprobs.isSome or attempt.stopReason.isSome or attempt.rejectionReason.isSome or
+        attempt.modelIdentity.isSome or attempt.tokenizerIdentity.isSome or attempt.chatTemplateSha256.isSome:
+      raise newException(FogError, "first model start must precede observed response facts")
+  else:
+    let before = gs.startedAttempts[id]
+    if (before["latency_ms"].kind != JNull or before["response_reader_joined"] == %true) and evidence != before:
+      raise newException(FogError, "finished native attempt evidence is immutable")
+    for key in ["prompt", "request", "decoder", "policy"]:
+      if evidence[key] != before[key]:
+        raise newException(FogError, "started model request evidence is immutable")
+    for key in ["response_body_b64", "response_headers_b64"]:
+      if before[key].kind != JNull:
+        if evidence[key].kind != JString or
+            not decode(evidence[key].getStr()).startsWith(decode(before[key].getStr())):
+          raise newException(FogError, "received native bytes cannot be rewritten")
+    if before["response_complete"] == %true and
+        (evidence["response_complete"] != %true or evidence["response_body_b64"] != before["response_body_b64"] or
+          evidence["response_headers_b64"] != before["response_headers_b64"]):
+      raise newException(FogError, "complete native response cannot be rewritten")
+    for key in ["http_status", "response_headers", "platform_call_id", "provider_request_id",
+        "model_identity", "tokenizer_identity", "chat_template_sha256"]:
+      if before[key].kind != JNull and evidence[key] != before[key]:
+        raise newException(FogError, "received native identity cannot be rewritten")
+  if gs.completedAttempts.hasKey(id) and evidence != gs.completedAttempts[id]:
+    raise newException(FogError, "completed native evidence is immutable")
+  gs.startedAttempts[id] = copy(evidence)
+  if completed: gs.completedAttempts[id] = copy(evidence)
+  if gs.pendingSeat == seat and gs.pendingId == id:
+    var updated = false
+    for existing in gs.externalAttempts.mitems:
+      if existing.attemptId == attempt.attemptId:
+        let parsed = existing.parsedAction
+        let accepted = existing.accepted
+        let rejection = existing.rejectionReason
+        existing = attempt
+        existing.parsedAction = parsed
+        existing.accepted = accepted
+        existing.rejectionReason = rejection
+        updated = true
+    if not updated: gs.externalAttempts.add(attempt)
+
+proc issueExternalPhase(gs: var GameState, seat: int, retry: bool) =
+  inc gs.decisionId
+  let id = "fog-" & $gs.sim.plies & "-" & $seat & "-" & $gs.pendingPhase & "-" & $gs.decisionId
+  let phase = $gs.pendingPhase
+  var user = userPrompt(gs.sim, seat, gs.prompts[seat], phase)
+  if retry: user.add(gs.sim.retryHint(seat, phase))
+  let messages = %*[{"role": "system", "content": systemPrompt(gs.sim, seat)},
+    {"role": "user", "content": user}]
+  gs.pendingId = id
+  gs.issuedSeats[id] = seat
+  gs.issuedAt[id] = getMonoTime()
+  gs.issuedPrompts[id] = messages
+  gs.latestDecisions[seat] = id
+  let decision = %*{"type": "decision", "protocol": "fogboards.player.v4", "decision_id": id,
+    "phase": phase, "observation": observationJson(gs.sim, seat), "messages": messages,
+    "transport": {"budget_ms": max(0'i64, (gs.phaseDeadline - getMonoTime()).inMilliseconds),
+      "cleanup_budget_ms": 5000}}
+  if gs.playerSockets.hasKey(seat):
+    if retry:
+      gs.playerSockets[seat].send($(%*{"type": "rejected", "decision_id": id,
+        "reason": "phase proposal rejected", "observation": decision}))
+    else: gs.playerSockets[seat].send($decision)
+
+proc finishEpisode(runtimeConfig: RuntimeConfig, episodeDeadline: MonoTime, failed = false) =
+  let cleanupDeadline = min(episodeDeadline, getMonoTime() + initDuration(seconds = 5))
+  var interrupted = interruptionRequested() or failed
+  var targets: seq[int]
+  withLock stateLock:
+    if state.finished: return
+    state.stopping = true
+    state.stopId = ""
+    for byte in urandom(16): state.stopId.add(toHex(byte, 2).toLowerAscii())
+    state.stopIssuedAt = getMonoTime()
+    state.acknowledgementDeadline = min(cleanupDeadline, getMonoTime() + initDuration(seconds = 3))
+    for slot, external in state.external:
+      if external and state.registered[slot]:
+        targets.add(slot)
+        if state.playerSockets.hasKey(slot):
+          state.playerSockets[slot].send($(%*{"type": "stop", "stop_id": state.stopId,
+            "decision_id": (if state.latestDecisions.hasKey(slot): %state.latestDecisions[slot] else: newJNull()),
+            "transport": {"cleanup_budget_ms": max(0'i64, (state.acknowledgementDeadline - getMonoTime()).inMilliseconds)}}))
+  while getMonoTime() < state.acknowledgementDeadline:
+    var joined = true
+    withLock stateLock:
+      for slot in targets: joined = joined and slot in state.stoppedSlots
+    if joined: break
+    sleep(10)
+  withLock stateLock:
+    for slot in targets:
+      if slot notin state.stoppedSlots: interrupted = true
+  var results, privateOutcome: JsonNode
   var replayData: string
   withLock stateLock:
-    if state.finished:
-      return
+    if state.finished: return
     state.finished = true
     results = state.sim.resultsJson()
+    var cleanup = newJObject()
+    for slot in targets: cleanup[$slot] = %(if slot in state.stoppedSlots: "joined" else: "unresolved")
+    privateOutcome = copy(results)
+    privateOutcome["player_cleanup"] = cleanup
     replayData = state.replayPayload(results)
     if state.trajectory.isSome:
+      for pending in state.pendingPhases:
+        var attempts = pending.attempts
+        for attempt in attempts.mitems:
+          for _, evidence in state.startedAttempts:
+            if evidence["attempt_id"] == %attempt.attemptId:
+              let parsed = attempt.parsedAction
+              let accepted = attempt.accepted
+              let rejection = attempt.rejectionReason
+              attempt = readAttemptEvidence(evidence)
+              attempt.parsedAction = parsed
+              attempt.accepted = accepted
+              attempt.rejectionReason = rejection
+        state.trajectory.get().recordDecision(pending.decisionId, pending.seat,
+          pending.observation, attempts, pending.selected, pending.action,
+          pending.status, terminal = pending.terminal, fallbackOrigin = pending.fallbackOrigin)
       var outcomes = newJObject()
       for seat in 0 ..< Seats: outcomes[$seat] = results["scores"][seat]
-      state.trajectory.get().finish(if results["reason"].getStr() == "complete":
-        esCompleted else: esTruncated, results, outcomes)
-
-    ## Send final frames to players BEFORE writing artifacts: the hosted
-    ## worker tears player pods down as soon as results.json exists, and
-    ## writing first would race player log collection. Results carry POLICY
-    ## names for the platform; the player sockets get the table aliases.
-    var aliasNames = newJArray()
-    for name in state.sim.names:
-      aliasNames.add(%name)
-    var final = %*{
-      "type": "final",
-      "done": true,
-      "scores": results["scores"],
-      "outcome": results["outcome"],
-      "names": aliasNames,
-      "plies": results["plies"],
-      "reason": results["reason"],
-      "ending": results["ending"]
-    }
-    for slot, socket in state.playerSockets:
-      final["slot"] = %slot
-      socket.send($final)
-    state.broadcastLocked()
-
-  sleep(500)
+      state.trajectory.get().finish(
+        if failed: esFailed
+        elif not interrupted and state.sim.done and results["reason"].getStr() == "complete":
+          esCompleted else: esTruncated,
+        privateOutcome, if interrupted: newJNull() else: outcomes)
+    if not interrupted:
+      var aliasNames = newJArray()
+      for name in state.sim.names: aliasNames.add(%name)
+      var final = %*{"type": "final", "done": true, "scores": results["scores"],
+        "outcome": results["outcome"], "names": aliasNames, "plies": results["plies"],
+        "reason": results["reason"], "ending": results["ending"]}
+      for slot, socket in state.playerSockets:
+        final["slot"] = %slot
+        socket.send($final)
+      state.broadcastLocked()
   if state.trajectory.isSome:
-    state.trajectory.get().writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
-  echo "fogboards: writing results and replay"
-  writeArtifact(
-    runtimeConfig.resultsUri, $results, "application/json",
-    "COGAME_RESULTS_METHOD"
-  )
-  writeArtifact(
-    runtimeConfig.replayUri, replayData, "application/octet-stream",
-    "COGAME_SAVE_REPLAY_METHOD"
-  )
-  ## Keep /healthz and /global answering for a bounded grace: the
-  ## certifier pings /global after the player pods start, and a short
-  ## episode is otherwise already gone.
-  echo "fogboards: artifacts written; serving for ", ShutdownGraceMs div 1000,
-    "s of shutdown grace"
-  sleep(ShutdownGraceMs)
-  echo "fogboards: episode complete, shutting down"
-  quit(0)
+    let trajectoryMethod = case getEnv("COGAME_SAVE_TRAJECTORY_METHOD", "PUT").toUpperAscii()
+      of "PUT": ahPut
+      of "POST": ahPost
+      else: raise newException(ValueError, "unsupported artifact method")
+    writeTrajectoryArtifact(state.trajectory.get(), getEnv(CogameSaveTrajectoryUriEnv), cleanupDeadline, trajectoryMethod)
+  if interrupted: return
+  writeArtifact(runtimeConfig.resultsUri, $results, "application/json",
+    "COGAME_RESULTS_METHOD", cleanupDeadline)
+  writeArtifact(runtimeConfig.replayUri, replayData, "application/octet-stream",
+    "COGAME_SAVE_REPLAY_METHOD", cleanupDeadline)
+  waitUntil(min(episodeDeadline, getMonoTime() + initDuration(milliseconds = ShutdownGraceMs)))
 
 proc plySpacing(config: GameConfig): float =
   if existsEnv("COWORLD_LLM_PLY_SPACING_SECONDS"):
@@ -242,62 +373,74 @@ proc plySpacing(config: GameConfig): float =
   else: (DerivedPlySpacingSeconds * (if config.sense > 0: 2 else: 1)).float
 
 proc worstPlySeconds(config: GameConfig): float =
-  ((if config.sense > 0: 4 else: 2) * config.llmTimeoutSeconds + PlyGuardSlackSeconds).float
+  ((if config.sense > 0: 2 else: 1) * config.llmTimeoutSeconds + PlyGuardSlackSeconds).float
 
 proc awaitExternalPhase(sim: Sim, mover: int, phase: ExternalPhase,
-    timeoutSeconds: int): bool {.gcsafe.} =
+    deadline: MonoTime): bool {.gcsafe.} =
   {.gcsafe.}:
     var connected = false
     withLock stateLock:
-      inc state.decisionId
       state.pendingSeat = mover
       state.pendingPhase = phase
+      state.phaseDeadline = deadline
       state.pendingAccepted = false
       state.externalAttempts = @[]
       state.externalRejections = 0
       state.externalFallback = false
-      if phase == epSense:
-        state.pendingSense = -1
+      if phase == epSense: state.pendingSense = -1
       connected = state.playerSockets.hasKey(mover)
-      if connected:
-        state.playerSockets[mover].send($ %*{
-          "type": "observation", "id": state.decisionId,
-          "phase": $phase, "observation": observationJson(sim, mover),
-          "messages": [{"role": "system", "content": systemPrompt(sim, mover)},
-            {"role": "user", "content": userPrompt(sim, mover, state.prompts[mover], $phase)}]
-        })
-    let deadline = epochTime() + timeoutSeconds.float
-    while connected and epochTime() < deadline:
+      state.issueExternalPhase(mover, retry = false)
+    while connected and getMonoTime() < deadline and not interruptionRequested():
       withLock stateLock:
         if state.pendingAccepted:
           result = true
           break
         connected = state.playerSockets.hasKey(mover)
-      sleep(20)
+      sleep(10)
     withLock stateLock:
       result = state.pendingAccepted
+      if not result:
+        for attempt in state.externalAttempts.mitems:
+          attempt.accepted = false
+          if attempt.rejectionReason.isNone:
+            attempt.rejectionReason = some(if interruptionRequested(): "native_interrupted" else: "phase_deadline")
       state.pendingSeat = -1
       state.pendingPhase = epNone
 
 proc recordPhase(gs: var GameState, before: Sim, seat: int, phase: string,
-    decision: Decision, attempts: seq[DecisionAttempt]) =
+    decision: Decision, attempts: seq[DecisionAttempt], applied = true) =
   if gs.trajectory.isNone: return
-  let action = gs.sim.phaseAction(decision, phase)
+  let action = if applied: gs.sim.phaseAction(decision, phase) else: newJNull()
   var selected = none(string)
-  if not decision.scripted and not decision.fellBack and attempts.len > 0:
+  if applied and not decision.scripted and not decision.fellBack and attempts.len > 0:
     selected = some(attempts[^1].attemptId)
-  gs.trajectory.get().recordDecision("fog-" & $before.plies & "-" & $seat &
-    "-" & phase, $seat, observationJson(before, seat), attempts, selected, action,
-    if selected.isSome: asAccepted else: asFallback, terminal = gs.sim.done,
-    fallbackOrigin = if selected.isNone: some("game-" & $gs.baselines[seat]) else: none(string))
+  gs.pendingPhases.add(PendingPhase(
+    decisionId: "fog-" & $before.plies & "-" & $seat & "-" & phase,
+    seat: $seat, observation: observationJson(before, seat), attempts: attempts,
+    selected: selected, action: action,
+    status: if not applied: asMissing elif selected.isSome: asAccepted else: asFallback,
+    terminal: gs.sim.done or not applied,
+    fallbackOrigin: if applied and selected.isNone: some("game-" & $gs.baselines[seat]) else: none(string)))
 
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
+    defer: gameServer.close()
+    var episodeDeadline = getMonoTime() + initDuration(seconds = 5)
+    var finalizationStarted = false
+    defer:
+      if not finalizationStarted:
+        requestNativeStop()
+        finishEpisode(runtimeConfig, episodeDeadline, failed = true)
     let config = state.config
-    let gameStart = epochTime()
-    let connectDeadline = gameStart + config.playerConnectTimeoutSeconds
+    let gameStart = getMonoTime()
+    let timeoutSeconds = parseFloat(getEnv("COWORLD_TIMEOUT_SECONDS", $config.episodeTimeoutSeconds))
+    if classify(timeoutSeconds) in {fcNan, fcInf, fcNegInf} or timeoutSeconds <= 0:
+      raise newException(FogError, "episode timeout must be finite and positive")
+    episodeDeadline = gameStart + initDuration(milliseconds = int64(timeoutSeconds * 1000))
+    let playDeadline = gameStart + initDuration(milliseconds = int64(timeoutSeconds * PlayBudgetFraction * 1000))
+    let connectDeadline = min(playDeadline, gameStart + initDuration(milliseconds = int64(config.playerConnectTimeoutSeconds * 1000)))
 
-    while epochTime() < connectDeadline:
+    while getMonoTime() < connectDeadline and not interruptionRequested():
       var allConnected = false
       withLock stateLock:
         allConnected = state.playerSockets.len >= config.tokens.len
@@ -305,7 +448,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           allConnected = allConnected and registered
       if allConnected:
         break
-      sleep(200)
+      waitUntil(min(connectDeadline, getMonoTime() + initDuration(milliseconds = 200)))
 
     withLock stateLock:
       state.started = true
@@ -315,28 +458,9 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
     let client = newLlmClient(config)
 
-    ## The platform kills the episode at its timeout and keeps NOTHING, so
-    ## play inside a fraction of it. The hosted dispatcher hands the
-    ## timeout only to its own worker sidecar, NOT to the game container,
-    ## so when the env is silent assume the configured platform default.
-    let hostedTimeout = getEnv("COWORLD_TIMEOUT_SECONDS", "").strip()
-    var timeoutSeconds =
-      if hostedTimeout.len > 0:
-        try: parseFloat(hostedTimeout) except ValueError: 0.0
-      else: 0.0
-    if timeoutSeconds <= 0.0:
-      timeoutSeconds = config.episodeTimeoutSeconds.float
-    let playDeadline =
-      if timeoutSeconds > 0.0: gameStart + timeoutSeconds * PlayBudgetFraction
-      else: 0.0
-    if playDeadline > 0.0:
-      echo "fogboards: episode timeout ", timeoutSeconds.int, "s (",
-        (if hostedTimeout.len > 0: "from env" else: "assumed"),
-        "); playing until ", (timeoutSeconds * PlayBudgetFraction).int, "s"
-
     let guard = config.worstPlySeconds()
     let spacing = config.plySpacing()
-    var lastLlmStart = 0.0
+    var lastLlmStart = none(MonoTime)
 
     while true:
       var simCopy: Sim
@@ -349,9 +473,9 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       ## 1. beginPly, and 2. the wall-clock guard — checked BEFORE any
       ## observation is built, so the episode never stops mid-ply.
       withLock stateLock:
-        if state.sim.done:
+        if state.sim.done or interruptionRequested():
           mover = -1
-        elif playDeadline > 0.0 and epochTime() + guard > playDeadline:
+        elif getMonoTime() + initDuration(milliseconds = int64(guard * 1000)) > playDeadline:
           echo "fogboards: play deadline would be crossed by the next ply " &
             "(after ", state.sim.plies, "/", config.maxPlies,
             " plies); settling on distance"
@@ -368,17 +492,19 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       if mover < 0:
         break
 
-      ## 13 (of the previous ply). The Bedrock sidecar caps 30 requests per
-      ## minute per episode; a ply issues at most two, so LLM-driven plies
-      ## start no closer together than the derived floor. Scripted seats
-      ## are not gated, which is what keeps offline certification fast.
+      ## Configured pacing bounds starts of native/external plies.
+      ## Scripted seats proceed immediately. Recheck the phase budget after
+      ## waiting, before rendering or applying another decision.
       let usesLlm = seatExternal or not (seatScripted or client.disabled)
-      if usesLlm and lastLlmStart > 0.0:
-        let wait = lastLlmStart + spacing - epochTime()
-        if wait > 0.0:
-          sleep(int(wait * 1000))
-      if usesLlm:
-        lastLlmStart = epochTime()
+      if usesLlm and lastLlmStart.isSome:
+        waitUntil(min(playDeadline, lastLlmStart.get() + initDuration(milliseconds = int64(spacing * 1000))))
+      if interruptionRequested(): break
+      if getMonoTime() + initDuration(milliseconds = int64(guard * 1000)) > playDeadline:
+        withLock stateLock:
+          state.sim.endEarly()
+          state.broadcastLocked()
+        break
+      if usesLlm: lastLlmStart = some(getMonoTime())
 
       ## Apply the sense before exposing its private window to any policy.
       var anchor = -1
@@ -387,7 +513,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         var sense: Decision
         var attempts: seq[DecisionAttempt]
         if seatExternal:
-          let accepted = awaitExternalPhase(simCopy, mover, epSense, config.llmTimeoutSeconds)
+          let accepted = awaitExternalPhase(simCopy, mover, epSense, min(playDeadline, getMonoTime() + initDuration(seconds = config.llmTimeoutSeconds)))
           withLock stateLock:
             attempts = state.externalAttempts
             sense = if accepted: Decision(anchor: state.pendingSense, cell: -1)
@@ -395,8 +521,15 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             sense.fellBack = not accepted or state.externalFallback
         else:
           sense = client.decidePhase(simCopy, mover, seatPrompt, seatBaseline,
-            seatScripted, "sense")
+            seatScripted, "sense", min(playDeadline, getMonoTime() + initDuration(seconds = config.llmTimeoutSeconds)))
           attempts = client.attempts
+        if interruptionRequested():
+          withLock stateLock:
+            for attempt in attempts.mitems:
+              attempt.accepted = false
+              attempt.rejectionReason = some("native_interrupted")
+            state.recordPhase(simCopy, mover, "sense", sense, attempts, applied = false)
+          break
         anchor = sense.anchor
         senseFallback = sense.fellBack
         withLock stateLock:
@@ -409,7 +542,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var decision: Decision
       var attempts: seq[DecisionAttempt]
       if seatExternal:
-        let accepted = awaitExternalPhase(simCopy, mover, epAttempt, config.llmTimeoutSeconds)
+        let accepted = awaitExternalPhase(simCopy, mover, epAttempt, min(playDeadline, getMonoTime() + initDuration(seconds = config.llmTimeoutSeconds)))
         withLock stateLock:
           attempts = state.externalAttempts
           decision = if accepted: state.pendingDecision
@@ -417,8 +550,15 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           decision.fellBack = not accepted or state.externalFallback
       else:
         decision = client.decidePhase(simCopy, mover, seatPrompt, seatBaseline,
-          seatScripted, "attempt", anchor)
+          seatScripted, "attempt", min(playDeadline, getMonoTime() + initDuration(seconds = config.llmTimeoutSeconds)), anchor)
         attempts = client.attempts
+      if interruptionRequested():
+        withLock stateLock:
+          for attempt in attempts.mitems:
+            attempt.accepted = false
+            attempt.rejectionReason = some("native_interrupted")
+          state.recordPhase(simCopy, mover, "attempt", decision, attempts, applied = false)
+        break
       withLock stateLock:
         if state.sim.done: break
         if decision.fellBack or senseFallback: inc state.sim.fallbacks[mover]
@@ -427,16 +567,17 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         state.recordPhase(simCopy, mover, "attempt", decision, attempts)
         echo "fogboards: ply ", state.sim.plies, " ", state.sim.names[mover],
           " plays ", state.sim.cellName(decision.cell), " at ",
-          (epochTime() - gameStart).int, "s"
+          (getMonoTime() - gameStart).inSeconds, "s"
         state.broadcastLocked()
 
       if config.turnDelayMs > 0:
-        sleep(config.turnDelayMs)
+        waitUntil(min(playDeadline, getMonoTime() + initDuration(milliseconds = config.turnDelayMs)))
 
     ## Let the verdict land before the final frame.
     if config.turnDelayMs > 0:
-      sleep(config.turnDelayMs)
-    finishEpisode(runtimeConfig)
+      waitUntil(min(playDeadline, getMonoTime() + initDuration(milliseconds = config.turnDelayMs)))
+    finalizationStarted = true
+    finishEpisode(runtimeConfig, episodeDeadline)
 
 var gameThread: Thread[RuntimeConfig]
 
@@ -491,22 +632,23 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
       slot = parseInt(slotText)
     except ValueError:
       discard
-    var authorized = false
     withLock stateLock:
-      authorized = slot >= 0 and slot < state.config.tokens.len and
+      let authorized = slot >= 0 and slot < state.config.tokens.len and
         state.config.tokens[slot] == token
-    if not authorized:
-      request.respond(401)
-      return
-    let websocket = request.upgradeToWebSocket()
-    withLock stateLock:
+      if not authorized:
+        request.respond(401)
+        return
+      if state.started or state.stopping or state.finished or state.playerSockets.hasKey(slot):
+        request.respond(409)
+        return
+      let websocket = request.upgradeToWebSocket()
       state.playerSockets[slot] = websocket
       state.socketSlots[websocket] = slot
       echo "fogboards: player slot ", slot, " connected (",
         state.playerSockets.len, "/", state.config.tokens.len, ")"
       websocket.send($ %*{
         "type": "welcome",
-        "protocol": "fogboards.player.v3",
+        "protocol": "fogboards.player.v4",
         "slot": slot,
         "name": state.sim.names[slot],
         "seats": Seats,
@@ -540,6 +682,7 @@ proc websocketHandler(
     of OpenEvent:
       discard
     of MessageEvent:
+      let receivedAt = getMonoTime()
       ## mummy hands Ping frames to the application instead of answering
       ## them itself; the platform's certifier pings /global to check the
       ## game is alive, so an unanswered ping fails certification.
@@ -569,18 +712,12 @@ proc websocketHandler(
               let text = node.getStr().strip()
               if text.len > 0 and text.toLowerAscii() notin ["0", "false", "no"]:
                 scripted = true
-                ## An unknown baseline name must not take the PROMPT down
-                ## with it: parseBaseline raises, and the handler's outer
-                ## `except` would drop the whole frame, leaving the slot
-                ## with neither a baseline nor the prompt it delivered.
-                try:
-                  baseline = parseBaseline(text)
-                except CatchableError:
-                  echo "fogboards: slot ", slot, " asked for an unknown ",
-                    "baseline (", cleanText(text, 40), "); using probe"
+                baseline = parseBaseline(text)
             else:
               discard
           withLock stateLock:
+            if state.started or state.stopping or state.finished or state.registered[slot]:
+              raise newException(FogError, "policy registration is frozen")
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted
             state.baselines[slot] = baseline
@@ -592,61 +729,124 @@ proc websocketHandler(
         elif payload{"type"}.getStr() == "register" and
             payload["control"].getStr() == "external":
           withLock stateLock:
+            if state.started or state.stopping or state.finished or state.registered[slot]:
+              raise newException(FogError, "policy registration is frozen")
+            state.prompts[slot] = cleanText(payload["prompt"].getStr(), MaxPromptLen)
             state.external[slot] = true
             state.registered[slot] = true
           echo "fogboards: slot ", slot, " registered external control"
-        elif payload{"type"}.getStr() == "action":
-          let id = payload["id"].getInt()
+        elif payload["type"].getStr() in ["attempt_started", "action"]:
+          let id = payload["decision_id"].getStr()
           withLock stateLock:
-            if state.external[slot] and state.pendingSeat == slot and
-                state.decisionId == id and not state.pendingAccepted:
-              var attempt = if payload.hasKey("training_attempt"):
-                readAttemptEvidence(payload["training_attempt"])
-                else: newDecisionAttempt("fog-external-" & $id & "-" &
-                  $state.externalAttempts.len, "external-fog", aoUnknown)
-              if attempt.origin in {aoTeacher, aoHuman}: attempt.origin = aoUnknown
-              if not payload.hasKey("training_attempt"): attempt.response = copy(payload)
-              attempt.rejectionReason = some("external phase proposal not applied")
-              state.externalAttempts.add(attempt)
-              if state.pendingPhase == epNone:
-                raise newException(FogError, "no external decision pending")
-              let phase = $state.pendingPhase
-              var proposal = state.sim.phaseProposal(slot, $payload, phase, state.pendingSense)
-              if attempt.origin == aoModel:
-                let sampled = state.sim.phaseProposal(slot,
-                  (if attempt.response.kind == JString: attempt.response.getStr() else: ""),
-                  phase, state.pendingSense)
-                if sampled.accepted:
-                  state.externalAttempts[^1].parsedAction = state.sim.phaseAction(sampled.decision, phase)
-                if not sampled.accepted or not proposal.accepted or
-                    state.externalAttempts[^1].parsedAction != state.sim.phaseAction(proposal.decision, phase):
-                  proposal.accepted = false
-                  proposal.rejection = "model response differs from player action"
-              var chosen: Decision
-              if proposal.accepted:
-                chosen = proposal.decision
-                if attempt.origin != aoModel:
-                  state.externalAttempts[^1].parsedAction = state.sim.phaseAction(chosen, phase)
-                state.externalAttempts[^1].accepted = true
-                state.externalAttempts[^1].rejectionReason = none(string)
-              else:
-                inc state.externalRejections
-                state.externalAttempts[^1].rejectionReason = some(proposal.rejection)
-                if state.externalRejections == 1:
-                  websocket.send($(%*{"type": "rejected", "id": id, "phase": phase,
-                    "reason": proposal.rejection, "observation": observationJson(state.sim, slot),
-                    "messages": [{"role": "system", "content": systemPrompt(state.sim, slot)},
-                      {"role": "user", "content": userPrompt(state.sim, slot,
-                        state.prompts[slot], phase) & state.sim.retryHint(slot, phase)}]}))
-                  return
+            if state.finished: return
+            if not state.external[slot] or not state.issuedSeats.hasKey(id) or
+                state.issuedSeats[id] != slot or receivedAt < state.issuedAt[id]:
+              raise newException(FogError, "decision does not belong to authenticated issued seat")
+            if payload["type"].getStr() == "attempt_started":
+              state.retainExternalAttempt(slot, id, payload["training_attempt"], completed = false)
+              return
+            let evidence = payload["training_attempt"]
+            let source = payload["source"].getStr()
+            if source notin ["llm", "unknown", "fallback"]:
+              raise newException(FogError, "unknown external action source")
+            if evidence.kind != JNull and source != "unknown":
+              state.retainExternalAttempt(slot, id, evidence, completed = true)
+            elif source == "llm":
+              raise newException(FogError, "model action requires native evidence")
+            if state.stopping or interruptionRequested() or state.pendingSeat != slot or
+                state.pendingId != id or state.pendingAccepted or receivedAt > state.phaseDeadline:
+              return
+            let phase = $state.pendingPhase
+            var attempt = if evidence.kind == JNull:
+              newDecisionAttempt(id & "-external", "external-fog", aoUnknown)
+              else: readAttemptEvidence(evidence)
+            if source == "unknown": attempt.origin = aoUnknown
+            if evidence.kind == JNull: attempt.response = copy(payload["action"])
+            let transportRejection = attempt.rejectionReason
+            attempt.rejectionReason = some("external phase proposal not applied")
+            var proposal = if source == "fallback": PhaseProposal()
+              else: state.sim.phaseProposal(slot, $payload["action"], phase, state.pendingSense)
+            if source == "llm":
+              if attempt.response.kind != JString or attempt.rawResponse.kind != JString or
+                  attempt.responseComplete != some(true) or attempt.responseReaderJoined != some(true) or
+                  attempt.httpStatus != some(200) or attempt.model.isNone or transportRejection.isSome:
+                raise newException(FogError, "model action requires its complete successful native response")
+              let served = parseJson(attempt.rawResponse.getStr())
+              var text = ""
+              if served.kind != JObject or served["content"].kind != JArray or served["model"] != %attempt.model.get():
+                raise newException(FogError, "selected model differs from received native body")
+              for contentBlock in served["content"]:
+                if contentBlock.kind != JObject or contentBlock["type"].kind != JString:
+                  raise newException(FogError, "native content block violates completion schema")
+                if contentBlock["type"].getStr() == "text":
+                  if contentBlock["text"].kind != JString:
+                    raise newException(FogError, "native text content must be text")
+                  text.add(contentBlock["text"].getStr())
+              if %text != attempt.response:
+                raise newException(FogError, "selected response differs from received native body")
+              let sampled = state.sim.phaseProposal(slot, attempt.response.getStr(), phase, state.pendingSense)
+              if sampled.accepted: attempt.parsedAction = state.sim.phaseAction(sampled.decision, phase)
+              if not sampled.accepted or not proposal.accepted or
+                  attempt.parsedAction != state.sim.phaseAction(proposal.decision, phase):
+                proposal.accepted = false
+                proposal.rejection = "model response differs from player action"
+            var chosen: Decision
+            var retry = false
+            if proposal.accepted:
+              chosen = proposal.decision
+              if source != "llm": attempt.parsedAction = state.sim.phaseAction(chosen, phase)
+              attempt.accepted = true
+              attempt.rejectionReason = none(string)
+            else:
+              inc state.externalRejections
+              attempt.rejectionReason = some(if source == "fallback": "player fallback" else: proposal.rejection)
+              retry = state.externalRejections == 1 and source != "fallback"
+              if not retry:
                 chosen = state.sim.scriptedPhase(slot, state.baselines[slot], phase, state.pendingSense)
                 state.externalFallback = true
-                websocket.send($(%*{"type": "consumed_rejection", "id": id,
-                  "phase": phase, "reason": proposal.rejection,
+                websocket.send($(%*{"type": "consumed_rejection", "decision_id": id,
+                  "phase": phase, "reason": attempt.rejectionReason.get(),
                   "action": state.sim.phaseAction(chosen, phase)}))
-              if state.pendingPhase == epSense: state.pendingSense = chosen.anchor
-              else: state.pendingDecision = chosen
-              state.pendingAccepted = true
+            var stored = false
+            for existing in state.externalAttempts.mitems:
+              if existing.attemptId == attempt.attemptId:
+                existing = attempt
+                stored = true
+            if not stored: state.externalAttempts.add(attempt)
+            if retry:
+              state.issueExternalPhase(slot, retry = true)
+              return
+            if state.pendingPhase == epSense: state.pendingSense = chosen.anchor
+            else: state.pendingDecision = chosen
+            state.pendingAccepted = true
+        elif payload["type"].getStr() == "stopped":
+          withLock stateLock:
+            if state.finished: return
+            if not state.external[slot] or payload["worker_status"].getStr() notin ["joined", "no_active_call"] or
+                payload["attempts"].kind != JArray:
+              raise newException(FogError, "stop must carry its authenticated worker status and attempts")
+            let id = payload["decision_id"]
+            if id.kind == JString:
+              if not state.issuedSeats.hasKey(id.getStr()) or state.issuedSeats[id.getStr()] != slot or
+                  receivedAt < state.issuedAt[id.getStr()]:
+                raise newException(FogError, "stop evidence does not belong to authenticated issued seat")
+              for evidence in payload["attempts"]:
+                state.retainExternalAttempt(slot, id.getStr(), evidence, completed = false)
+            elif id.kind != JNull or payload["attempts"].len != 0:
+              raise newException(FogError, "stop without issued decision cannot assert model attempts")
+            if state.playerSockets.hasKey(slot) and state.playerSockets[slot] == websocket:
+              websocket.send($(%*{"type": "evidence_received", "decision_id": id, "stop_id": payload["stop_id"]}))
+            let latest = if state.latestDecisions.hasKey(slot): %state.latestDecisions[slot] else: newJNull()
+            if not state.stopping or id != latest or receivedAt < state.stopIssuedAt or
+                receivedAt > state.acknowledgementDeadline or payload["stop_id"] != %state.stopId:
+              raise newException(FogError, "stop acknowledgement differs from issued cleanup window")
+            for evidence in payload["attempts"]:
+              if readAttemptEvidence(evidence).responseReaderJoined != some(true):
+                raise newException(FogError, "stop retains an unjoined native reader")
+            for issued, known in state.startedAttempts:
+              if state.issuedSeats[issued] == slot and readAttemptEvidence(known).responseReaderJoined != some(true):
+                raise newException(FogError, "stop omitted an unjoined issued native reader")
+            state.stoppedSlots.incl(slot)
       except CatchableError as error:
         echo "fogboards: ignoring invalid player frame"
     of ErrorEvent:
@@ -655,7 +855,6 @@ proc websocketHandler(
       withLock stateLock:
         if websocket in state.socketSlots:
           let slot = state.socketSlots[websocket]
-          state.socketSlots.del(websocket)
           if state.playerSockets.getOrDefault(slot) == websocket:
             state.playerSockets.del(slot)
         state.globalSockets.excl(websocket)
@@ -712,7 +911,7 @@ proc runReplayServer*(runtimeConfig: RuntimeConfig) =
   replayPayloadGlobal = $enriched
 
   let router = buildRouter(replayMode = true)
-  gameServer = newServer(router, websocketHandler)
+  gameServer = newServer(router, websocketHandler, workerThreads = 4, maxMessageLen = 16 * 1024 * 1024)
   echo "fogboards: replay mode on ", runtimeConfig.host, ":",
     runtimeConfig.port
   gameServer.serve(Port(runtimeConfig.port), runtimeConfig.host)
@@ -735,7 +934,20 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)
-  gameServer = newServer(router, websocketHandler)
-  createThread(gameThread, runGame, runtimeConfig)
+  gameServer = newServer(router, websocketHandler, workerThreads = 4, maxMessageLen = 16 * 1024 * 1024)
+  installNativeStopHandlers()
+  var ownerCreated = false
   echo "fogboards: serving on ", runtimeConfig.host, ":", runtimeConfig.port
-  gameServer.serve(Port(runtimeConfig.port), runtimeConfig.host)
+  try:
+    gameServer.serve(Port(runtimeConfig.port), runtimeConfig.host,
+      onReady = proc(server: Server) {.gcsafe.} =
+        {.gcsafe.}:
+          createThread(gameThread, runGame, runtimeConfig)
+          ownerCreated = true)
+  finally:
+    let wasInterrupted = interruptionRequested()
+    requestNativeStop()
+    if ownerCreated:
+      joinThread(gameThread)
+    else:
+      finishEpisode(runtimeConfig, getMonoTime() + initDuration(seconds = 5), failed = not wasInterrupted)

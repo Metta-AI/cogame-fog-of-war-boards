@@ -40,10 +40,10 @@ RUN rm -f nim.cfg && \
     else echo "--path:\"$pkg\"" >> nim.cfg; fi; \
   done && \
   echo '--path:"src"' >> nim.cfg && \
-  nim c -d:release -d:useMalloc --opt:speed --stackTrace:on \
+  nim c --parallelBuild:1 -d:release -d:useMalloc --opt:speed --stackTrace:on \
     --nimcache:/tmp/fogboards-nimcache --out:fog-of-war-boards \
     src/fogboards.nim && \
-  nim c -d:release -d:useMalloc --opt:speed --stackTrace:on \
+  nim c --parallelBuild:1 -d:release -d:useMalloc --opt:speed --stackTrace:on \
     --nimcache:/tmp/fogboards-player-nimcache \
     --out:fog-of-war-boards-player src/fogboards_player.nim
 

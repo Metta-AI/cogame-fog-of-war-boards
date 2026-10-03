@@ -128,6 +128,7 @@ for variant in manifest["variants"]:
                 for decision in decisions:
                     phases = set()
                     for attempt in decision["attempts"]:
+                        assert attempt["inference_mode"] == "text_action"
                         identity = attempt["platform_call_id"]
                         request, body, phase = calls[identity]
                         joined.add(identity)

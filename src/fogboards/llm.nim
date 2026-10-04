@@ -590,7 +590,8 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
   client.lastAttempt.model = some(client.model)
   client.lastAttempt.decoder = %*{"temperature": client.temperature,
     "max_tokens": client.maxOutputTokens}
-  let response = performNativePost(url, headers, $body, deadline)
+  var requestControl: NativeRequestControl
+  let response = performNativePost(url, headers, $body, deadline, requestControl)
   client.lastAttempt.latencyMs = response.latencyMs
   client.lastAttempt.responseReaderJoined = response.responseReaderJoined
   let observedResponse = response.httpStatus.isSome or response.headerBytes.len > 0 or response.bodyBytes.len > 0

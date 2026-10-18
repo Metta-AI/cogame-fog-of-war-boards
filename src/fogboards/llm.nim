@@ -13,7 +13,7 @@
 import
   std/[base64, json, math, monotimes, options, os, sets, strutils, tables, unicode],
   bitworld/decision_trajectory, bitworld/native_http, bitworld/native_stop,
-  sim
+  sim, prompts
 
 const
   AnthropicVersion = "2023-06-01"
@@ -336,13 +336,12 @@ proc refereeLog*(sim: Sim, seat: int): string =
     return "(nothing yet — this is your first action)"
   lines.join("\n")
 
-proc systemPrompt*(sim: Sim, seat: int): string =
+proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
   ## One system prompt per mode, identical for both seats: the rules
   ## verbatim, the seat's alias, and the output contract.
   let n = sim.config.size
   let lastFile = $chr(ord('a') + n - 1)
-  result.add("You are " & sim.names[seat] & ", a cog playing " &
-    "Fog-of-War Boards against " & sim.names[1 - seat] & ".\n\nRules:\n")
+  result.add(selection.introduction(sim.names[seat], sim.names[1 - seat]) & "\n\nRules:\n")
   if sim.config.mode == mPhantomTtt:
     result.add("- The board is a 3x3 grid. Files a, b, c run left to " &
       "right; ranks 1, 2, 3 run bottom to top, so the cells are a1..c3.\n")
@@ -785,13 +784,13 @@ proc phaseProposal*(sim: Sim, seat: int, response: string, phase: string,
     result.rejection = error.msg
 
 proc decidePhase*(client: LlmClient, sim: Sim, seat: int, prompt: string,
-    baseline: Baseline, scripted: bool, phase: string, deadline: MonoTime, anchor = -1): Decision =
+    baseline: Baseline, scripted: bool, phase: string, deadline: MonoTime, selection: PromptSelection, anchor = -1): Decision =
   ## The server applies sense before rendering the next private attempt prompt.
   client.attempts = @[]
   if scripted or client.disabled:
     result = scriptedPhase(sim, seat, baseline, phase, anchor)
     return
-  let system = systemPrompt(sim, seat)
+  let system = systemPrompt(sim, seat, selection)
   for index in 0 .. 1:
     if interruptionRequested() or getMonoTime() >= deadline: break
     var user = userPrompt(sim, seat, prompt, phase)
@@ -817,15 +816,15 @@ proc decidePhase*(client: LlmClient, sim: Sim, seat: int, prompt: string,
   result.fellBack = true
 
 proc decide*(client: LlmClient, sim: Sim, seat: int, prompt: string,
-    baseline: Baseline, scripted: bool, deadline: MonoTime): Decision =
+    baseline: Baseline, scripted: bool, deadline: MonoTime, selection: PromptSelection): Decision =
   ## Offline callers follow the same two phases on their private simulator.
   var after = sim
   var anchor = -1
   var senseFallback = false
   if sim.config.sense > 0:
-    let sense = client.decidePhase(sim, seat, prompt, baseline, scripted, "sense", deadline)
+    let sense = client.decidePhase(sim, seat, prompt, baseline, scripted, "sense", deadline, selection)
     anchor = sense.anchor
     senseFallback = sense.fellBack
     after.applySense(seat, anchor)
-  result = client.decidePhase(after, seat, prompt, baseline, scripted, "attempt", deadline, anchor)
+  result = client.decidePhase(after, seat, prompt, baseline, scripted, "attempt", deadline, selection, anchor)
   result.fellBack = result.fellBack or senseFallback

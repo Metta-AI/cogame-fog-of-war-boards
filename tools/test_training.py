@@ -1,5 +1,6 @@
 """Exercise full native matches, including recon sense-before-move."""
 
+import hashlib
 import json
 import random
 import subprocess
@@ -73,6 +74,14 @@ with tempfile.TemporaryDirectory() as directory:
                 assert teacher[field] is None
             prompt = teacher["prompt"][1]["content"]
             view = row["observation"]
+            metadata = view["prompt_template"]
+            assert metadata["bank"] == "fog-of-war-boards-rules-v1"
+            assert metadata["variant"] == "canonical"
+            for message in teacher["prompt"]:
+                assert (
+                    metadata[message["role"] + "_sha256"].lower()
+                    == hashlib.sha256(message["content"].encode()).hexdigest()
+                )
             assert view["name"] != view["opponentName"]
             assert view["mode"] and view["legalAttempts"]
             assert "YOUR LEGAL ATTEMPTS:" in prompt

@@ -416,7 +416,8 @@ proc recordPhase(gs: var GameState, before: Sim, seat: int, phase: string,
   if applied and not decision.scripted and not decision.fellBack and attempts.len > 0:
     selected = some(attempts[^1].attemptId)
   let view = observationJson(before, seat)
-  let messages = if attempts.len > 0: attempts[^1].prompt else:
+  let messages = if gs.external[seat]: gs.issuedPrompts[gs.pendingId]
+    elif attempts.len > 0: attempts[^1].prompt else:
     %*[{"role": "system", "content": systemPrompt(before, seat, gs.selection)},
       {"role": "user", "content": userPrompt(before, seat, gs.prompts[seat], phase)}]
   view["prompt_template"] = gs.selection.promptMetadata(

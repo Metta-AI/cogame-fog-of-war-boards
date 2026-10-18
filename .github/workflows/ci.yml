@@ -163,6 +163,7 @@ jobs:
           nim c --hints:off -d:release --path:src -o:/tmp/fogboards-game src/fogboards.nim
           nim c --hints:off -d:release --path:src -o:/tmp/fogboards-player src/fogboards_player.nim
           python3 tools/test_native_trajectory.py /tmp/fogboards-game /tmp/fogboards-player
+          python3 tools/test_native_prompts.py /tmp/fogboards-game /tmp/fogboards-player /tmp/fogboards-native-prompts --smoke
           python3 tools/test_native_lifecycle.py /tmp/fogboards-game /tmp/fogboards-player /tmp/fogboards-native-lifecycle
 
       - name: Exercise phased ordinary players

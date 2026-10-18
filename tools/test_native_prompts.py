@@ -136,7 +136,7 @@ def main():
             assert (
                 episode["event_type"] == "episode" and episode["status"] == "completed"
             )
-            assert episode["outcome"] == results
+            assert episode["outcome"] == {**results, "player_cleanup": {}}
             assert episode["source_revision"] == "uncommitted-fogboards-validation"
             decisions = records[:-1]
             assert len(decisions) == results["plies"] * (

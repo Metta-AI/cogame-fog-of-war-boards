@@ -1,8 +1,10 @@
 # Fog-of-War Boards training
 
 The native host, language bridge, and teacher exporter share one prompt builder.
-Five training introductions preserve rules, private views, action schemas, and
-budgets. Canonical wording preserves the original prompt byte for byte.
+Five training wordings vary fog, evidence, and collision explanations while
+preserving board rules, private views, action schemas, and budgets. Canonical
+recon wording now correctly includes reconnaissance as an information source;
+other canonical variants preserve their original bytes.
 
 Set `promptVariant` to `canonical` (default), `plain`, `numbered`, `questions`,
 `reordered`, or `mixed`. Mixed selection requires a nonnegative `promptSeed`;
@@ -11,7 +13,7 @@ the episode without consuming simulator randomness. `heldout-briefing` and
 `heldout-reference` are evaluation-only. The language bridge rejects these
 when reset with `split: "train"`.
 
-Private observations include bank `fog-of-war-boards-rules-v1`, wording, seed,
+Private observations include bank `fog-of-war-boards-rules-v2`, wording, seed,
 and SHA-256 hashes of actual system/user messages, including retry instructions.
 Existing native trajectories retain attempts, provider identity, responses, and
 executed phases. Operator instructions and prompt metadata stay out of replays.
@@ -39,14 +41,15 @@ independently into training and validation.
 
 ## Validation and experiments
 
-`tools/test_prompt_games.py BRIDGE ORIGINAL_BRIDGE` runs 100 complete language
-games and eight original comparisons, including recon phases and retries.
-`tools/test_training.py EXPORTER BRIDGE` exercises complete exports and both
-bridge interfaces. `tools/test_native_prompts.py GAME PLAYER OUTPUT` runs four
-canonical variants and seven additional recon wording cases at published pacing
-and budgets. `--smoke` selects phantom and recon canonical cases. The closed
-inference endpoint checks actual failed requests, fallback execution, private
-hashes, and replay joins; it does not measure provider inference or learning.
+`tools/test_prompt_games.py BRIDGE` runs 40 complete language games across all
+four board variants, including recon phases, retry failures, and matched play.
+`tools/test_training.py EXPORTER BRIDGE` exercises mixed-wording candidate exports,
+both bridge interfaces, and the complete language games. Mixed exports cycle
+through five training wordings while retaining each episode's seed family.
+The existing `tools/test_native_trajectory.py GAME PLAYER` fixture checks actual
+mixed-selected HTTP prompts, failed requests, fallback execution, private hashes,
+and replay joins. These fixtures use local inference stubs and do not measure
+provider inference or learning.
 
 Compare canonical and mixed training with matched game seeds, seats, opponents,
 and inference settings. Report win rate, invalid-action rate, fallback rate,

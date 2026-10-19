@@ -19,7 +19,7 @@ with tempfile.TemporaryDirectory() as directory:
     for variant in VARIANTS:
         output = Path(directory) / variant
         subprocess.run(
-            [str(EXPORTER), str(output), "10", variant, "fixture-v3"],
+            [str(EXPORTER), str(output), "10", variant, "fixture-v3", "mixed", "0"],
             cwd=ROOT,
             check=True,
         )
@@ -36,6 +36,13 @@ with tempfile.TemporaryDirectory() as directory:
         assert (output / "trajectories.jsonl").stat().st_mode & 0o777 == 0o600
         assert manifest["variant"] == variant and len(manifest["runs"]) == 10
         assert manifest["episodes"] == 10
+        assert [run["prompt_selection"]["variant"] for run in manifest["runs"]] == [
+            "canonical",
+            "plain",
+            "numbered",
+            "questions",
+            "reordered",
+        ] * 2
         assert (
             not (output / "train.jsonl").exists()
             and not (output / "validation.jsonl").exists()
@@ -75,8 +82,13 @@ with tempfile.TemporaryDirectory() as directory:
             prompt = teacher["prompt"][1]["content"]
             view = row["observation"]
             metadata = view["prompt_template"]
-            assert metadata["bank"] == "fog-of-war-boards-rules-v1"
-            assert metadata["variant"] == "canonical"
+            assert metadata["bank"] == "fog-of-war-boards-rules-v2"
+            assert (
+                metadata["variant"]
+                == ("canonical", "plain", "numbered", "questions", "reordered")[
+                    metadata["seed"] % 5
+                ]
+            )
             for message in teacher["prompt"]:
                 assert (
                     metadata[message["role"] + "_sha256"].lower()
@@ -278,3 +290,7 @@ with tempfile.TemporaryDirectory() as directory:
                 process.stdin.close()
                 process.stdout.close()
                 assert process.wait(timeout=5) == 0
+
+subprocess.run(
+    [sys.executable, str(ROOT / "tools/test_prompt_games.py"), str(BRIDGE)], check=True
+)

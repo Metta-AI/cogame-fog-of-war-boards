@@ -38,12 +38,14 @@ when isMainModule:
     trajectoryRows: seq[string]
     runs = newJArray()
   for seed in 1 .. episodes:
+    var wording = selection
+    if wording.variant == pvMixed: wording.seed += seed - 1
     variantConfig["seed"] = %seed
     var config = defaultGameConfig()
     config.update($variantConfig)
     config = sampleEpisode(config)
     var game = initSim(config)
-    let episodeId = "fogboards-" & variant & "-" & $seed & "-" & $selection.selectedVariant & "-" & $selection.seed
+    let episodeId = "fogboards-" & variant & "-" & $seed & "-" & $wording.selectedVariant & "-" & $wording.seed
     let trajectory = newDecisionTrajectory(episodeId, "fog-" & $seed,
       "fog-of-war-boards", gameVersion, revision)
     var decisionIndex = 0
@@ -55,9 +57,9 @@ when isMainModule:
       for phase in phases:
         let view = observationJson(game, seat)
         let prompt = %*[
-          {"role": "system", "content": systemPrompt(game, seat, selection)},
+          {"role": "system", "content": systemPrompt(game, seat, wording)},
           {"role": "user", "content": userPrompt(game, seat, "", phase)}]
-        view["prompt_template"] = selection.promptMetadata(
+        view["prompt_template"] = wording.promptMetadata(
           prompt[0]["content"].getStr(), prompt[1]["content"].getStr())
         let decision = game.scriptedPhase(seat, baseline, phase, anchor)
         let reply = game.phaseAction(decision, phase)
@@ -83,7 +85,7 @@ when isMainModule:
     trajectoryRows.add(trajectory.eventsJsonl().strip())
     doAssert game.reason == "complete"
     runs.add(%*{"seed": seed, "plies": game.plies,
-      "scores": resultsJson(game)["scores"]})
+      "scores": resultsJson(game)["scores"], "prompt_selection": wording.selectionMetadata()})
   writePrivate(output / "trajectories.jsonl", trajectoryRows.join("\n") & "\n")
   writePrivate(output / "manifest.json", pretty(%*{
     "schema_version": 1,

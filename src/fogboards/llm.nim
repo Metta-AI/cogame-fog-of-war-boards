@@ -337,8 +337,7 @@ proc refereeLog*(sim: Sim, seat: int): string =
   lines.join("\n")
 
 proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
-  ## One system prompt per mode, identical for both seats: the rules
-  ## verbatim, the seat's alias, and the output contract.
+  ## Configuration-derived board rules, selected wording, and output contract.
   let n = sim.config.size
   let lastFile = $chr(ord('a') + n - 1)
   result.add(selection.introduction(sim.names[seat], sim.names[1 - seat]) & "\n\nRules:\n")
@@ -362,18 +361,52 @@ proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
       "stones. BLUE (seat 1) wins by linking the bottom rank (1) to the " &
       "top rank (" & $n & "). A full board always has exactly one " &
       "winner: there are no draws.\n")
-  result.add("- THE FOG: you see only your OWN stones. You are never told " &
-    "anything about your opponent's moves. The only way you ever learn " &
-    "where an opponent stone is, is by naming that cell yourself and " &
-    "being told OCCUPIED.\n")
-  if sim.config.abrupt:
-    result.add("- A ply that names a cell already holding an opponent " &
-      "stone places NOTHING and ENDS YOUR TURN. You have spent your move " &
-      "to buy one certainty.\n")
-  else:
-    result.add("- A ply that names a cell already holding an opponent " &
-      "stone places NOTHING, but does NOT end your turn: you move again " &
-      "immediately, now knowing one more cell.\n")
+  let evidence = if sim.config.sense > 0:
+    "your own OCCUPIED attempt results and reconnaissance windows"
+    else: "your own OCCUPIED attempt results"
+  let fog = case selection.selectedVariant
+    of pvCanonical:
+      if sim.config.sense > 0:
+        "- THE FOG: your own stones are visible. Opponent moves are never announced. You learn enemy locations from your own OCCUPIED attempts and reconnaissance windows.\n"
+      else:
+        "- THE FOG: you see only your OWN stones. You are never told anything about your opponent's moves. The only way you ever learn where an opponent stone is, is by naming that cell yourself and being told OCCUPIED.\n"
+    of pvPlain:
+      "- Your stones are visible; opposing moves are not announced. Enemy positions become known through " & evidence & ".\n"
+    of pvNumbered:
+      "- Visibility: your own stones.\n- Opponent move announcements: none.\n- Evidence of enemy locations: " & evidence & ".\n"
+    of pvQuestions:
+      "- What can you see directly? Your own stones. Are opposing moves announced? No. How do you learn enemy locations? Through " & evidence & ".\n"
+    of pvReordered:
+      "- Use " & evidence & " to learn enemy locations. Opponent moves are never announced, and your own stones remain visible.\n"
+    of pvHeldoutBriefing:
+      "- Track the hidden board from evidence. You see your own stones and receive no announcements of opposing moves; learn enemy positions through " & evidence & ".\n"
+    of pvHeldoutReference:
+      "- Own stones: visible. Opponent moves: unannounced. Enemy-location evidence: " & evidence & ".\n"
+    of pvMixed: raise newException(ValueError, "mixed selection must resolve to a training wording")
+  result.add(fog)
+  let consequence = if sim.config.abrupt:
+    "your turn ends"
+    else: "your turn continues immediately"
+  let collision = case selection.selectedVariant
+    of pvCanonical:
+      if sim.config.abrupt:
+        "- A ply that names a cell already holding an opponent stone places NOTHING and ENDS YOUR TURN. You have spent your move to buy one certainty.\n"
+      else:
+        "- A ply that names a cell already holding an opponent stone places NOTHING, but does NOT end your turn: you move again immediately, now knowing one more cell.\n"
+    of pvPlain:
+      "- Attempting an enemy-occupied cell adds no stone and " & consequence & ". The attempt makes that cell's occupation certain.\n"
+    of pvNumbered:
+      "- On an enemy-occupied attempt: (1) place no stone, (2) " & consequence & ", (3) retain certain knowledge of that cell.\n"
+    of pvQuestions:
+      "- What if your chosen cell holds an enemy stone? You place nothing and " & consequence & ". What did you gain? Certainty about that cell.\n"
+    of pvReordered:
+      "- A collision buys certainty about one cell: no stone is placed and " & consequence & " when you attempt a cell containing an enemy stone.\n"
+    of pvHeldoutBriefing:
+      "- An attempt on an enemy stone is an information gain rather than a placement: it adds no stone, establishes that cell as occupied, and " & consequence & ".\n"
+    of pvHeldoutReference:
+      "- Enemy-cell attempt: no placement; " & consequence & "; cell occupancy becomes certain.\n"
+    of pvMixed: raise newException(ValueError, "mixed selection must resolve to a training wording")
+  result.add(collision)
   if sim.config.sense > 0:
     result.add("- RECONNAISSANCE: before each move you name the " &
       "bottom-left corner of a " & $sim.config.sense & "x" &

@@ -17,7 +17,7 @@ type
     seed*: int
 
 const
-  PromptBankVersion* = "fog-of-war-boards-rules-v1"
+  PromptBankVersion* = "fog-of-war-boards-rules-v2"
 
 proc promptSelection*(node: JsonNode): PromptSelection =
   if node.kind != JObject:

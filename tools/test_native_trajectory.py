@@ -55,6 +55,12 @@ for variant in manifest["variants"]:
                     else "mock/fixture"
                 )
                 assert request["model"] == expected_model
+                assert "- Use your own OCCUPIED attempt results" in request["system"]
+                if variant["id"] == "recon-hex-5":
+                    assert (
+                        "and reconnaissance windows to learn enemy locations."
+                        in request["system"]
+                    )
                 slot = int(self.headers["X-Coworld-Player-Slot"])
                 user = request["messages"][0]["content"]
                 phase = (
@@ -148,6 +154,8 @@ for variant in manifest["variants"]:
             config = {
                 **variant["game_config"],
                 "seed": 7,
+                "promptVariant": "mixed",
+                "promptSeed": 4,
                 "players": [{"name": "red"}, {"name": "blue"}],
                 "tokens": ["t0", "t1"],
                 "turnDelayMs": 0,

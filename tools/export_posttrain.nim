@@ -45,7 +45,7 @@ when isMainModule:
     config.update($variantConfig)
     config = sampleEpisode(config)
     var game = initSim(config)
-    let episodeId = "fogboards-" & variant & "-" & $seed & "-" & $wording.selectedVariant & "-" & $wording.seed
+    let episodeId = "fogboards-" & variant & "-" & $seed & "-" & $wording.variant & "-" & $wording.selectedVariant & "-" & $wording.seed
     let trajectory = newDecisionTrajectory(episodeId, "fog-" & $seed,
       "fog-of-war-boards", gameVersion, revision)
     var decisionIndex = 0

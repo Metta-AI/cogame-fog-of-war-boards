@@ -87,3 +87,7 @@ SHA-256 values, in the variant order above, were
 `af9ebb66f78937b562f0144331f4f268d8a857956bf62d274c049f9806ef69c0`,
 `f5174d2b1c088ee0646ab82c50418908c690d7a7d279306e7f6f131c85571243`,
 and `6a84fed90122cf6376a3f03fcd6a8eda304ec6ba03b4a25f542dd9e7a3b6275f`.
+
+Episode IDs include requested selection, resolved wording, and prompt seed, so
+matched explicit and mixed collections remain distinct. Scenario families and
+shared importer ownership of review and splitting stay unchanged.

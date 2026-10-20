@@ -1,5 +1,6 @@
 """Exercise full native matches, including recon sense-before-move."""
 
+import hashlib
 import json
 import random
 import subprocess
@@ -18,7 +19,7 @@ with tempfile.TemporaryDirectory() as directory:
     for variant in VARIANTS:
         output = Path(directory) / variant
         subprocess.run(
-            [str(EXPORTER), str(output), "10", variant, "fixture-v3"],
+            [str(EXPORTER), str(output), "10", variant, "fixture-v3", "mixed", "0"],
             cwd=ROOT,
             check=True,
         )
@@ -35,6 +36,13 @@ with tempfile.TemporaryDirectory() as directory:
         assert (output / "trajectories.jsonl").stat().st_mode & 0o777 == 0o600
         assert manifest["variant"] == variant and len(manifest["runs"]) == 10
         assert manifest["episodes"] == 10
+        assert [run["prompt_selection"]["variant"] for run in manifest["runs"]] == [
+            "canonical",
+            "plain",
+            "numbered",
+            "questions",
+            "reordered",
+        ] * 2
         assert (
             not (output / "train.jsonl").exists()
             and not (output / "validation.jsonl").exists()
@@ -73,6 +81,19 @@ with tempfile.TemporaryDirectory() as directory:
                 assert teacher[field] is None
             prompt = teacher["prompt"][1]["content"]
             view = row["observation"]
+            metadata = view["prompt_template"]
+            assert metadata["bank"] == "fog-of-war-boards-rules-v2"
+            assert (
+                metadata["variant"]
+                == ("canonical", "plain", "numbered", "questions", "reordered")[
+                    metadata["seed"] % 5
+                ]
+            )
+            for message in teacher["prompt"]:
+                assert (
+                    metadata[message["role"] + "_sha256"].lower()
+                    == hashlib.sha256(message["content"].encode()).hexdigest()
+                )
             assert view["name"] != view["opponentName"]
             assert view["mode"] and view["legalAttempts"]
             assert "YOUR LEGAL ATTEMPTS:" in prompt
@@ -269,3 +290,7 @@ with tempfile.TemporaryDirectory() as directory:
                 process.stdin.close()
                 process.stdout.close()
                 assert process.wait(timeout=5) == 0
+
+subprocess.run(
+    [sys.executable, str(ROOT / "tools/test_prompt_games.py"), str(BRIDGE)], check=True
+)

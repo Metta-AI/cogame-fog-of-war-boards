@@ -21,7 +21,7 @@ import
   bitworld/runtime, bitworld/decision_trajectory, bitworld/native_stop, bitworld/artifact_runtime,
   mummy,
   mummy/routers,
-  llm,
+  prompts, llm,
   sim
 
 const
@@ -57,6 +57,7 @@ type
     externalAttempts: seq[DecisionAttempt]
     externalRejections: int
     externalFallback: bool
+    selection: PromptSelection
     config: GameConfig
     sim: Sim
     prompts: seq[string]
@@ -263,7 +264,7 @@ proc issueExternalPhase(gs: var GameState, seat: int, retry: bool) =
   let phase = $gs.pendingPhase
   var user = userPrompt(gs.sim, seat, gs.prompts[seat], phase)
   if retry: user.add(gs.sim.retryHint(seat, phase))
-  let messages = %*[{"role": "system", "content": systemPrompt(gs.sim, seat)},
+  let messages = %*[{"role": "system", "content": systemPrompt(gs.sim, seat, gs.selection)},
     {"role": "user", "content": user}]
   gs.pendingId = id
   gs.issuedSeats[id] = seat
@@ -414,9 +415,16 @@ proc recordPhase(gs: var GameState, before: Sim, seat: int, phase: string,
   var selected = none(string)
   if applied and not decision.scripted and not decision.fellBack and attempts.len > 0:
     selected = some(attempts[^1].attemptId)
+  let view = observationJson(before, seat)
+  let messages = if gs.external[seat]: gs.issuedPrompts[gs.pendingId]
+    elif attempts.len > 0: attempts[^1].prompt else:
+    %*[{"role": "system", "content": systemPrompt(before, seat, gs.selection)},
+      {"role": "user", "content": userPrompt(before, seat, gs.prompts[seat], phase)}]
+  view["prompt_template"] = gs.selection.promptMetadata(
+    messages[0]["content"].getStr(), messages[1]["content"].getStr())
   gs.pendingPhases.add(PendingPhase(
     decisionId: "fog-" & $before.plies & "-" & $seat & "-" & phase,
-    seat: $seat, observation: observationJson(before, seat), attempts: attempts,
+    seat: $seat, observation: view, attempts: attempts,
     selected: selected, action: action,
     status: if not applied: asMissing elif selected.isSome: asAccepted else: asFallback,
     terminal: gs.sim.done or not applied,
@@ -521,7 +529,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             sense.fellBack = not accepted or state.externalFallback
         else:
           sense = client.decidePhase(simCopy, mover, seatPrompt, seatBaseline,
-            seatScripted, "sense", min(playDeadline, getMonoTime() + initDuration(seconds = config.llmTimeoutSeconds)))
+            seatScripted, "sense", min(playDeadline, getMonoTime() + initDuration(seconds = config.llmTimeoutSeconds)), state.selection)
           attempts = client.attempts
         if interruptionRequested():
           withLock stateLock:
@@ -550,7 +558,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           decision.fellBack = not accepted or state.externalFallback
       else:
         decision = client.decidePhase(simCopy, mover, seatPrompt, seatBaseline,
-          seatScripted, "attempt", min(playDeadline, getMonoTime() + initDuration(seconds = config.llmTimeoutSeconds)), anchor)
+          seatScripted, "attempt", min(playDeadline, getMonoTime() + initDuration(seconds = config.llmTimeoutSeconds)), state.selection, anchor)
         attempts = client.attempts
       if interruptionRequested():
         withLock stateLock:
@@ -920,6 +928,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   if config.tokens.len != config.players.len:
     raise newException(FogError, "tokens and players must align")
   state.config = config
+  state.selection = promptSelection(parseJson(runtimeConfig.config))
   state.sim = initSim(config)
   if getEnv(CogameSaveTrajectoryUriEnv).len > 0:
     state.trajectory = some(newDecisionTrajectory(getEnv("COWORLD_EPISODE_ID"),

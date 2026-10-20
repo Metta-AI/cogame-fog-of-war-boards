@@ -1,35 +1,60 @@
 # Fog-of-War Boards training
 
-The exporter plays ten complete native matches per variant. Each decision
-records the hosted system prompt, the acting seat's fogged user prompt, and
-the `probe` or `sweep` reply accepted by the production parser. The
-`recon-hex-5` exporter applies the teacher's sense before its move. Train
-and validation sets split whole matches by seed.
+The native host, language bridge, and teacher exporter share one prompt builder.
+Five training wordings vary fog, evidence, and collision explanations while
+preserving board rules, private views, action schemas, and budgets. Canonical
+recon wording now correctly includes reconnaissance as an information source;
+other canonical variants preserve their original bytes.
+
+Set `promptVariant` to `canonical` (default), `plain`, `numbered`, `questions`,
+`reordered`, or `mixed`. Mixed selection requires a nonnegative `promptSeed`;
+`promptSeed % 5` chooses a training wording. Selection remains fixed throughout
+the episode without consuming simulator randomness. `heldout-briefing` and
+`heldout-reference` are evaluation-only. The language bridge rejects these
+when reset with `split: "train"`.
+
+Private observations include bank `fog-of-war-boards-rules-v2`, wording, seed,
+and SHA-256 hashes of actual system/user messages, including retry instructions.
+Existing native trajectories retain attempts, provider identity, responses, and
+executed phases. Operator instructions and prompt metadata stay out of replays.
+
+## Candidate trajectories
+
+Run from a clean, committed checkout. At least ten complete games and an
+explicit game version are required:
 
 ```sh
 nim c -d:release --path:src -o:/tmp/fogboards-posttrain tools/export_posttrain.nim
-/tmp/fogboards-posttrain /tmp/fogboards-data 10 recon-hex-5
+/tmp/fogboards-posttrain /tmp/fogboards-data 10 recon-hex-5 GAME_VERSION plain 0
 ```
 
-The other certified variants are `phantom-ttt-3`, `dark-hex-4`, and
-`dark-hex-5`. The output contains `train.jsonl`, `validation.jsonl`, and a
-manifest with source revision, seeds, plies, final scores, and row counts.
-Ten matches yielded 88/22, 64/16, 72/18, and 72/18 train/validation
-decisions respectively, in that variant order.
+Other published variants are `phantom-ttt-3`, `dark-hex-4`, and `dark-hex-5`.
+Omit the final two arguments for canonical wording. Held-out exports are rejected.
+Private outputs contain `trajectories.jsonl` and `manifest.json`, with source
+revision and outcomes. Scripted `probe` and `sweep` policies supply teacher
+actions. Recon applies sense before rendering the attempt's fresh private view.
 
-All 370 examples fit 4,096 tokens with the local WordLevel smoke tokenizer.
-One CPU optimizer step reduced four-example validation loss from 1.85891
-to 1.85353, 1.83972 to 1.83441, 1.82757 to 1.82295, and 1.78231 to
-1.77724 in the same variant order. This verifies the post-training path;
-it does not measure league play.
+These are candidates, not approved training examples. The shared Coworld
+trajectory importer owns review and dataset splits. Keep each `fog-SEED`
+family together across board variants and wordings; never split each wording
+independently into training and validation.
 
-From a Metta checkout with the post-training package installed:
+## Validation and experiments
 
-```sh
-uv run --package metta-posttrain --extra train python -m metta_posttrain.train \
-  --dataset /tmp/fogboards-data --output /tmp/fogboards-adapter \
-  --model Qwen/Qwen3-0.6B --max-steps 100 --max-length 4096
-```
+`tools/test_prompt_games.py BRIDGE` runs 40 complete language games across all
+four board variants, including recon phases, retry failures, and matched play.
+`tools/test_training.py EXPORTER BRIDGE` exercises mixed-wording candidate exports,
+both bridge interfaces, and the complete language games. Mixed exports cycle
+through five training wordings while retaining each episode's seed family.
+The existing `tools/test_native_trajectory.py GAME PLAYER` fixture checks actual
+mixed-selected HTTP prompts, failed requests, fallback execution, private hashes,
+and replay joins. These fixtures use local inference stubs and do not measure
+provider inference or learning.
+
+Compare canonical and mixed training with matched game seeds, seats, opponents,
+and inference settings. Report win rate, invalid-action rate, fallback rate,
+request counts, and completion rates for familiar and held-out wording.
+No learning stability improvement is claimed by deterministic checks.
 
 ## Numeric reinforcement learning
 
@@ -62,3 +87,7 @@ SHA-256 values, in the variant order above, were
 `af9ebb66f78937b562f0144331f4f268d8a857956bf62d274c049f9806ef69c0`,
 `f5174d2b1c088ee0646ab82c50418908c690d7a7d279306e7f6f131c85571243`,
 and `6a84fed90122cf6376a3f03fcd6a8eda304ec6ba03b4a25f542dd9e7a3b6275f`.
+
+Episode IDs include requested selection, resolved wording, and prompt seed, so
+matched explicit and mixed collections remain distinct. Scenario families and
+shared importer ownership of review and splitting stay unchanged.

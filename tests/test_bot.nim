@@ -5,7 +5,7 @@
 ## coworld, not a nicety.
 
 import std/[json, monotimes, os, sets, strutils, tables, times, unittest]
-import fogboards/[llm, sim]
+import fogboards/[llm, sim, prompts]
 
 proc fixture(mode = mDarkHex, size = 5, abrupt = true, sense = 0,
     maxPlies = 50, seed = 0): GameConfig =
@@ -200,10 +200,10 @@ suite "native endpoint availability":
     var sim = initSim(config)
     let mover = sim.beginPly()
     let decision = client.decide(sim, mover, "take the middle", blProbe,
-      scripted = false, deadline = getMonoTime() + initDuration(seconds = 1))
+      scripted = false, deadline = getMonoTime() + initDuration(seconds = 1), selection = PromptSelection())
     check decision.cell == scriptedDecision(sim, mover, blProbe).cell
     check not decision.fellBack
-    let sweep = client.decide(sim, mover, "", blSweep, scripted = true, deadline = getMonoTime() + initDuration(seconds = 1))
+    let sweep = client.decide(sim, mover, "", blSweep, scripted = true, deadline = getMonoTime() + initDuration(seconds = 1), selection = PromptSelection())
     check sweep.cell == scriptedDecision(sim, mover, blSweep).cell
 
   test "a scripted seat name is parsed the way the player sends it":

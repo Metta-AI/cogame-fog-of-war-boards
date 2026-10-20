@@ -2,7 +2,7 @@
 ## nim c -d:release --path:src -o:/tmp/fogboards-train-bridge tools/train_bridge.nim
 
 import std/[hashes, json, os, sets, tables]
-import fogboards/[llm, sim]
+import fogboards/[llm, sim, prompts]
 
 var
   game: Sim
@@ -13,11 +13,12 @@ var
   sensePending: bool
   senseAnchor: int
   operatorPrompt: string
+  selection: PromptSelection
   retryCount: int
 
 proc currentDecision(): JsonNode =
   let seat = game.beginPly()
-  let system = systemPrompt(game, seat)
+  let system = systemPrompt(game, seat, selection)
   let phase = if language and sensePending: "sense" else: "attempt"
   var user = userPrompt(game, seat, operatorPrompt, phase)
   if language and retryCount > 0: user.add(game.retryHint(seat, phase))
@@ -42,6 +43,7 @@ proc currentDecision(): JsonNode =
     "inference_mode": (if language: %"text_action" else: newJNull()),
     "turn": game.plies,
     "semantic_view": {"system": system, "user": user,
+      "prompt_template": selection.promptMetadata(system, user),
       "phase": phase, "observation": observationJson(game, seat)},
     "inbox": [], "messages": [
       {"role": "system", "content": system},
@@ -51,6 +53,10 @@ proc currentDecision(): JsonNode =
 
 proc reset(command: JsonNode): JsonNode =
   doAssert command["players"].getInt() == Seats
+  selection = promptSelection(command)
+  if selection.selectedVariant in {pvHeldoutBriefing, pvHeldoutReference} and
+      command{"split"}.getStr("train") == "train":
+    raise newException(ValueError, "held-out wording cannot be used for training")
   let manifest = parseFile(manifestPath)
   var variantConfig = newJNull()
   for entry in manifest["variants"]:

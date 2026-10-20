@@ -2,6 +2,7 @@
 # Used by tools/build_replay_viewer.sh when no local emcc is available; the
 # output is architecture-neutral WebAssembly.
 FROM emscripten/emsdk:4.0.15 AS replay-viewer-builder
+SHELL ["/usr/bin/nice", "-n", "19", "/bin/sh", "-c"]
 
 RUN apt-get update && \
   apt-get install -y --no-install-recommends ca-certificates curl git && \

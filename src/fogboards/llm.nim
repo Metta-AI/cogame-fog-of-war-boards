@@ -13,7 +13,7 @@
 import
   std/[base64, json, math, monotimes, options, os, sets, strutils, tables, unicode],
   bitworld/decision_trajectory, bitworld/native_http, bitworld/native_stop,
-  sim
+  sim, prompts
 
 const
   AnthropicVersion = "2023-06-01"
@@ -336,13 +336,11 @@ proc refereeLog*(sim: Sim, seat: int): string =
     return "(nothing yet — this is your first action)"
   lines.join("\n")
 
-proc systemPrompt*(sim: Sim, seat: int): string =
-  ## One system prompt per mode, identical for both seats: the rules
-  ## verbatim, the seat's alias, and the output contract.
+proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
+  ## Configuration-derived board rules, selected wording, and output contract.
   let n = sim.config.size
   let lastFile = $chr(ord('a') + n - 1)
-  result.add("You are " & sim.names[seat] & ", a cog playing " &
-    "Fog-of-War Boards against " & sim.names[1 - seat] & ".\n\nRules:\n")
+  result.add(selection.introduction(sim.names[seat], sim.names[1 - seat]) & "\n\nRules:\n")
   if sim.config.mode == mPhantomTtt:
     result.add("- The board is a 3x3 grid. Files a, b, c run left to " &
       "right; ranks 1, 2, 3 run bottom to top, so the cells are a1..c3.\n")
@@ -363,18 +361,52 @@ proc systemPrompt*(sim: Sim, seat: int): string =
       "stones. BLUE (seat 1) wins by linking the bottom rank (1) to the " &
       "top rank (" & $n & "). A full board always has exactly one " &
       "winner: there are no draws.\n")
-  result.add("- THE FOG: you see only your OWN stones. You are never told " &
-    "anything about your opponent's moves. The only way you ever learn " &
-    "where an opponent stone is, is by naming that cell yourself and " &
-    "being told OCCUPIED.\n")
-  if sim.config.abrupt:
-    result.add("- A ply that names a cell already holding an opponent " &
-      "stone places NOTHING and ENDS YOUR TURN. You have spent your move " &
-      "to buy one certainty.\n")
-  else:
-    result.add("- A ply that names a cell already holding an opponent " &
-      "stone places NOTHING, but does NOT end your turn: you move again " &
-      "immediately, now knowing one more cell.\n")
+  let evidence = if sim.config.sense > 0:
+    "your own OCCUPIED attempt results and reconnaissance windows"
+    else: "your own OCCUPIED attempt results"
+  let fog = case selection.selectedVariant
+    of pvCanonical:
+      if sim.config.sense > 0:
+        "- THE FOG: your own stones are visible. Opponent moves are never announced. You learn enemy locations from your own OCCUPIED attempts and reconnaissance windows.\n"
+      else:
+        "- THE FOG: you see only your OWN stones. You are never told anything about your opponent's moves. The only way you ever learn where an opponent stone is, is by naming that cell yourself and being told OCCUPIED.\n"
+    of pvPlain:
+      "- Your stones are visible; opposing moves are not announced. Enemy positions become known through " & evidence & ".\n"
+    of pvNumbered:
+      "- Visibility: your own stones.\n- Opponent move announcements: none.\n- Evidence of enemy locations: " & evidence & ".\n"
+    of pvQuestions:
+      "- What can you see directly? Your own stones. Are opposing moves announced? No. How do you learn enemy locations? Through " & evidence & ".\n"
+    of pvReordered:
+      "- Use " & evidence & " to learn enemy locations. Opponent moves are never announced, and your own stones remain visible.\n"
+    of pvHeldoutBriefing:
+      "- Track the hidden board from evidence. You see your own stones and receive no announcements of opposing moves; learn enemy positions through " & evidence & ".\n"
+    of pvHeldoutReference:
+      "- Own stones: visible. Opponent moves: unannounced. Enemy-location evidence: " & evidence & ".\n"
+    of pvMixed: raise newException(ValueError, "mixed selection must resolve to a training wording")
+  result.add(fog)
+  let consequence = if sim.config.abrupt:
+    "your turn ends"
+    else: "your turn continues immediately"
+  let collision = case selection.selectedVariant
+    of pvCanonical:
+      if sim.config.abrupt:
+        "- A ply that names a cell already holding an opponent stone places NOTHING and ENDS YOUR TURN. You have spent your move to buy one certainty.\n"
+      else:
+        "- A ply that names a cell already holding an opponent stone places NOTHING, but does NOT end your turn: you move again immediately, now knowing one more cell.\n"
+    of pvPlain:
+      "- Attempting an enemy-occupied cell adds no stone and " & consequence & ". The attempt makes that cell's occupation certain.\n"
+    of pvNumbered:
+      "- On an enemy-occupied attempt: (1) place no stone, (2) " & consequence & ", (3) retain certain knowledge of that cell.\n"
+    of pvQuestions:
+      "- What if your chosen cell holds an enemy stone? You place nothing and " & consequence & ". What did you gain? Certainty about that cell.\n"
+    of pvReordered:
+      "- A collision buys certainty about one cell: no stone is placed and " & consequence & " when you attempt a cell containing an enemy stone.\n"
+    of pvHeldoutBriefing:
+      "- An attempt on an enemy stone is an information gain rather than a placement: it adds no stone, establishes that cell as occupied, and " & consequence & ".\n"
+    of pvHeldoutReference:
+      "- Enemy-cell attempt: no placement; " & consequence & "; cell occupancy becomes certain.\n"
+    of pvMixed: raise newException(ValueError, "mixed selection must resolve to a training wording")
+  result.add(collision)
   if sim.config.sense > 0:
     result.add("- RECONNAISSANCE: before each move you name the " &
       "bottom-left corner of a " & $sim.config.sense & "x" &
@@ -785,13 +817,13 @@ proc phaseProposal*(sim: Sim, seat: int, response: string, phase: string,
     result.rejection = error.msg
 
 proc decidePhase*(client: LlmClient, sim: Sim, seat: int, prompt: string,
-    baseline: Baseline, scripted: bool, phase: string, deadline: MonoTime, anchor = -1): Decision =
+    baseline: Baseline, scripted: bool, phase: string, deadline: MonoTime, selection: PromptSelection, anchor = -1): Decision =
   ## The server applies sense before rendering the next private attempt prompt.
   client.attempts = @[]
   if scripted or client.disabled:
     result = scriptedPhase(sim, seat, baseline, phase, anchor)
     return
-  let system = systemPrompt(sim, seat)
+  let system = systemPrompt(sim, seat, selection)
   for index in 0 .. 1:
     if interruptionRequested() or getMonoTime() >= deadline: break
     var user = userPrompt(sim, seat, prompt, phase)
@@ -817,15 +849,15 @@ proc decidePhase*(client: LlmClient, sim: Sim, seat: int, prompt: string,
   result.fellBack = true
 
 proc decide*(client: LlmClient, sim: Sim, seat: int, prompt: string,
-    baseline: Baseline, scripted: bool, deadline: MonoTime): Decision =
+    baseline: Baseline, scripted: bool, deadline: MonoTime, selection: PromptSelection): Decision =
   ## Offline callers follow the same two phases on their private simulator.
   var after = sim
   var anchor = -1
   var senseFallback = false
   if sim.config.sense > 0:
-    let sense = client.decidePhase(sim, seat, prompt, baseline, scripted, "sense", deadline)
+    let sense = client.decidePhase(sim, seat, prompt, baseline, scripted, "sense", deadline, selection)
     anchor = sense.anchor
     senseFallback = sense.fellBack
     after.applySense(seat, anchor)
-  result = client.decidePhase(after, seat, prompt, baseline, scripted, "attempt", deadline, anchor)
+  result = client.decidePhase(after, seat, prompt, baseline, scripted, "attempt", deadline, selection, anchor)
   result.fellBack = result.fellBack or senseFallback
